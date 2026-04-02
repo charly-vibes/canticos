@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>canticos — scripts personales</title>
+    <style>
+        :root {
+            --bg: #82B1FF;
+            --fg: #2D1B14;
+            --accent: #E91E63;
+            --muted: #6b5d58;
+            --card-bg: #F5F5F5;
+            --max-width: 50rem;
+            --border-radius: 8px;
+            --shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+            --code-bg: #eee8e4;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #2C2A4A;
+                --fg: #EAE1DF;
+                --accent: #FF007F;
+                --muted: #B392AC;
+                --card-bg: #1e1c32;
+                --code-bg: #16142a;
+            }
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--bg); color: var(--fg);
+            line-height: 1.7; padding: 2rem 1rem;
+        }
+        .container { max-width: var(--max-width); margin: 0 auto; }
+        a { color: var(--accent); text-decoration: none; font-weight: 500; }
+        a:hover { text-decoration: underline; }
+        header h1 { font-size: 2rem; font-weight: 700; margin-bottom: 0.25rem; }
+        header p { color: var(--muted); margin-bottom: 2rem; }
+        .back { font-size: 0.85rem; color: var(--muted); margin-bottom: 1.5rem; display: block; }
+        .scripts { list-style: none; display: grid; gap: 1.5rem; }
+        .script-card {
+            background: var(--card-bg); border-radius: var(--border-radius);
+            padding: 1.5rem 2rem; box-shadow: var(--shadow);
+        }
+        .script-card h3 {
+            margin-bottom: 0.25rem; display: flex;
+            align-items: baseline; gap: 0.75rem;
+        }
+        .script-card h3 a { color: var(--fg); font-size: 1.15rem; }
+        .script-card .meta { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.75rem; }
+        .script-card p { color: var(--muted); font-size: 0.95rem; }
+        .tag {
+            display: inline-block; font-size: 0.7rem; background: var(--bg);
+            color: var(--muted); padding: 0.15em 0.5em; border-radius: 4px;
+            margin-right: 0.25rem; font-weight: 500;
+        }
+        .install {
+            background: var(--card-bg); border-radius: var(--border-radius);
+            padding: 1.5rem 2rem; margin-top: 2rem; box-shadow: var(--shadow);
+        }
+        .install h2 { font-size: 1rem; color: var(--muted); text-transform: uppercase;
+            letter-spacing: 0.05em; margin-bottom: 0.75rem; }
+        pre {
+            background: var(--code-bg); border-radius: 6px; padding: 1rem 1.25rem;
+            overflow-x: auto; font-size: 0.9rem; line-height: 1.5;
+            font-family: 'SF Mono', 'Fira Code', monospace;
+        }
+        footer {
+            margin-top: 3rem; padding-top: 1.5rem;
+            border-top: 1px solid var(--muted);
+            color: var(--muted); font-size: 0.85rem; text-align: center;
+        }
+        @media (max-width: 600px) {
+            header h1 { font-size: 1.5rem; }
+            .script-card, .install { padding: 1.25rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <a class="back" href="https://charly-vibes.github.io/">&larr; charly vibes</a>
+
+        <header>
+            <h1>canticos</h1>
+            <p>C&aacute;nticos, invocaciones, escrituras &mdash; scripts de uso personal.</p>
+        </header>
+
+        <ul class="scripts">
+            <li class="script-card">
+                <h3><a href="https://github.com/charly-vibes/canticos/blob/main/bin/claude-dashboard.py">claude-dashboard</a></h3>
+                <div class="meta"><span class="tag">python</span> <span class="tag">html</span> <span class="tag">analytics</span></div>
+                <p>Dashboard HTML local de uso de Claude Code. Escanea sesiones, calcula costos estimados, genera gr&aacute;ficos de actividad, uso de herramientas, cache hit rate, y m&aacute;s. Todo offline, sin servidores.</p>
+            </li>
+            <li class="script-card">
+                <h3><a href="https://github.com/charly-vibes/canticos/blob/main/bin/to-projector">to-projector</a></h3>
+                <div class="meta"><span class="tag">bash</span> <span class="tag">ffmpeg</span> <span class="tag">vaapi</span></div>
+                <p>Convierte video a MP4 compatible con proyectores port&aacute;tiles (H.264 8-bit + AAC est&eacute;reo). Auto-detecta si necesita re-encoding o puede copiar streams. Soporta VAAPI para encoding por hardware, selecci&oacute;n de audio por idioma y quemado de subt&iacute;tulos.</p>
+            </li>
+            <li class="script-card">
+                <h3><a href="https://github.com/charly-vibes/canticos/blob/main/bin/projector-queue">projector-queue</a></h3>
+                <div class="meta"><span class="tag">bash</span> <span class="tag">batch</span></div>
+                <p>Procesa una cola de videos en ~/Downloads/MOVIES/ a trav&eacute;s de to-projector. Idempotente: los archivos convertidos se mueven a DONE/, los ya procesados se saltan.</p>
+            </li>
+            <li class="script-card">
+                <h3><a href="https://github.com/charly-vibes/canticos/blob/main/bin/transcribe">transcribe</a></h3>
+                <div class="meta"><span class="tag">bash</span> <span class="tag">whisper</span> <span class="tag">ffmpeg</span></div>
+                <p>Transcribe audio a texto usando whisper-cli. Convierte a WAV 16kHz mono, corre el modelo y deja un .txt junto al archivo original.</p>
+            </li>
+        </ul>
+
+        <div class="install">
+            <h2>Instalaci&oacute;n</h2>
+<pre>git clone https://github.com/charly-vibes/canticos.git
+cd canticos
+./install</pre>
+            <p style="margin-top: 0.75rem; color: var(--muted); font-size: 0.9rem;">
+                Crea symlinks en <code>~/.local/bin</code>. Si ya existe un archivo, lo respalda como <code>.bak</code>.
+            </p>
+        </div>
+
+        <footer>
+            <p>CC0 &middot; <a href="https://github.com/charly-vibes/canticos">repo</a></p>
+        </footer>
+    </div>
+</body>
+</html>
