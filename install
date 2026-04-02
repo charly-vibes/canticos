@@ -13,6 +13,7 @@ scripts=(
     to-projector
     transcribe
     claude-dashboard
+    ci-usage
 )
 
 for name in "${scripts[@]}"; do
