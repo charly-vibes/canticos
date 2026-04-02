@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# projector-queue — Process ~/Downloads/MOVIES/ through to-projector
+#
+# Converts each entry (file or directory) in MOVIES/ using to-projector,
+# then moves the source to MOVIES/DONE/. Idempotent: already-converted
+# files are skipped by to-projector, and already-moved sources are
+# naturally absent from the queue.
+
+queue_dir=""
+tp_args=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --) shift; tp_args+=("$@"); break ;;
+        *)  queue_dir="$1"; shift ;;
+    esac
+done
+readonly QUEUE="${queue_dir:-$HOME/Downloads/MOVIES}"
+readonly DONE="$QUEUE/DONE"
+
+mkdir -p "$DONE"
+
+succeeded=0
+failed=0
+skipped=0
+
+for entry in "$QUEUE"/*; do
+    [[ -e "$entry" ]] || continue
+    name="$(basename "$entry")"
+
+    # skip the DONE directory itself
+    [[ "$name" == "DONE" ]] && continue
+
+    # skip non-video loose files (e.g. .txt, .nfo)
+    if [[ -f "$entry" ]]; then
+        ext="${name##*.}"
+        case "$ext" in
+            mkv|avi|wmv|flv|webm|mov|mp4|ts|m2ts|mpg|mpeg|vob|ogv|3gp) ;;
+            *) ((++skipped)); continue ;;
+        esac
+    fi
+
+    # skip if already moved (idempotent)
+    if [[ -e "$DONE/$name" ]]; then
+        echo "SKIP (already done): $name"
+        ((++skipped))
+        continue
+    fi
+
+    echo "=== $name ==="
+
+    # directories get -r for recursive processing
+    args=()
+    [[ -d "$entry" ]] && args+=(-r)
+    args+=("$entry")
+
+    if to-projector "${tp_args[@]}" "${args[@]}"; then
+        mv "$entry" "$DONE/"
+        echo "  -> moved to DONE/"
+        ((++succeeded))
+    else
+        echo "  FAILED, leaving in place" >&2
+        ((++failed))
+    fi
+    echo
+done
+
+echo "Queue complete: $succeeded processed, $failed failed, $skipped skipped"

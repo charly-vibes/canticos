@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODEL="${WHISPER_MODEL:-$HOME/models/ggml-base.bin}"
+
+usage() {
+  echo "Usage: transcribe [-m model] [-l lang] <audio-file>"
+  echo ""
+  echo "Transcribes audio to text using whisper-cli."
+  echo "Outputs a .txt file next to the input file."
+  echo ""
+  echo "Options:"
+  echo "  -m MODEL  Path to whisper model (default: \$WHISPER_MODEL or ~/models/ggml-base.bin)"
+  echo "  -l LANG   Language code or 'auto' (default: auto)"
+  exit 1
+}
+
+LANG="auto"
+
+while getopts "m:l:h" opt; do
+  case "$opt" in
+    m) MODEL="$OPTARG" ;;
+    l) LANG="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[[ $# -lt 1 ]] && usage
+
+INPUT="$1"
+
+if [[ ! -f "$INPUT" ]]; then
+  echo "Error: file not found: $INPUT" >&2
+  exit 1
+fi
+
+if [[ ! -f "$MODEL" ]]; then
+  echo "Error: model not found: $MODEL" >&2
+  exit 1
+fi
+
+OUTPUT="${INPUT%.*}.txt"
+TMPWAV=$(mktemp /tmp/transcribe-XXXXXX.wav)
+trap 'rm -f "$TMPWAV"' EXIT
+
+echo "Converting to WAV..." >&2
+ffmpeg -y -i "$INPUT" -ar 16000 -ac 1 -c:a pcm_s16le "$TMPWAV" -loglevel error
+
+echo "Transcribing with $(basename "$MODEL")..." >&2
+whisper-cli -m "$MODEL" -l "$LANG" -f "$TMPWAV" --no-timestamps 2>/dev/null > "$OUTPUT"
+
+echo "$OUTPUT"

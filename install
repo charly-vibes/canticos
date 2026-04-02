@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# install — Symlink canticos scripts into ~/.local/bin
+
+REPO_BIN="$(cd "$(dirname "$(readlink -f "$0")")/bin" && pwd)"
+DEST="${1:-$HOME/.local/bin}"
+
+mkdir -p "$DEST"
+
+scripts=(
+    projector-queue
+    to-projector
+    transcribe
+    claude-dashboard
+)
+
+for name in "${scripts[@]}"; do
+    src="$REPO_BIN/$name"
+    dst="$DEST/$name"
+
+    if [[ ! -f "$src" ]]; then
+        echo "SKIP (missing): $name" >&2
+        continue
+    fi
+
+    if [[ -L "$dst" && "$(readlink -f "$dst")" == "$src" ]]; then
+        echo "  ok  $name"
+        continue
+    fi
+
+    if [[ -e "$dst" ]]; then
+        mv "$dst" "$dst.bak"
+        echo "  bak $dst -> $dst.bak"
+    fi
+
+    ln -s "$src" "$dst"
+    echo " link $name -> $dst"
+done
+
+echo "Done. Make sure $DEST is in your PATH."

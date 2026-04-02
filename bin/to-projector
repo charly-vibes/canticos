@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# to-projector — Convert video files to projector-compatible MP4
+#
+# DESCRIPTION
+#   Converts video files (MKV, AVI, WebM, etc.) into MP4 files suitable for
+#   USB playback on MAGCubic and similar Android-based portable projectors.
+#
+#   Auto-detects per file whether re-encoding is needed. If the video is
+#   already H.264 8-bit yuv420p, the video stream is copied (fast, no
+#   quality loss); otherwise it is re-encoded to H.264. Audio is handled
+#   the same way: stereo AAC is copied, everything else is re-encoded to
+#   stereo AAC 192k (surround tracks cause silence on many projectors).
+#
+#   Use --remux to force stream copy, or --encode to force re-encoding.
+#   VAAPI hardware encoding is auto-detected and used when available
+#   (AMD/Intel GPUs), falling back to software (libx264) otherwise.
+#
+#   Subtitles are stripped by default. Use --subs LANG to burn a subtitle
+#   track into the video.
+#
+# OUTPUT
+#   By default, converted files are written to ~/PROJECTOR with slugified
+#   filenames (lowercase, spaces/punctuation replaced with hyphens). Use
+#   -o/--output to specify a different directory (e.g. a mounted USB drive).
+#   Existing output files are skipped, making the command safe to re-run.
+#   A temporary file (.converting_*) is used during conversion and renamed
+#   on success, so interrupted runs won't leave corrupt output.
+#
+# SUPPORTED INPUT FORMATS
+#   mkv, avi, wmv, flv, webm, mov, mp4, ts, m2ts, mpg, mpeg, vob, ogv, 3gp
+#
+# DEPENDENCIES
+#   ffmpeg (required), vainfo (optional, for VAAPI detection)
+#
+# EXIT CODES
+#   0   All files converted (or skipped) successfully
+#   1   Error (missing input, missing ffmpeg, conversion failure)
+
+readonly PROG="$(basename "$0")"
+readonly VIDEO_EXTS="mkv|avi|wmv|flv|webm|mov|mp4|ts|m2ts|mpg|mpeg|vob|ogv|3gp"
+
+usage() {
+    cat <<EOF
+Usage: $PROG [options] <file|dir> [file|dir ...]
+
+Convert video files to projector-friendly MP4.
+
+Options:
+  -o, --output DIR     Output directory (default: ~/PROJECTOR)
+  --remux              Force fast copy of all streams (no re-encoding)
+  --encode             Force re-encoding even if already H.264 8-bit
+  --hw                 Use VAAPI hardware encoding (auto-detected by default)
+  --sw                 Force software encoding (libx264, slower but no GPU needed)
+  --alang LANG         Select audio track by language (e.g. "eng", "ita")
+  --subs LANG          Burn in subtitles for given language (e.g. "eng", "spa")
+  --no-subs            Strip all subtitles (default)
+  -r, --recursive      Recurse into subdirectories
+  -n, --dry-run        Show what would be done without doing it
+  -h, --help           Show this help
+
+Examples:
+  $PROG movie.mkv                       # convert to ~/PROJECTOR/movie.mp4
+  $PROG ~/Videos/                       # convert all videos in dir
+  $PROG -o /mnt/usb/ *.mkv             # output to USB drive
+  $PROG --subs eng show/               # burn English subs
+  $PROG --alang eng movie.mkv           # select English audio track
+  $PROG --remux movie.mkv              # force fast copy (no re-encode)
+  $PROG -r -n ~/Videos/                # dry-run recursive preview
+  $PROG -o /mnt/usb/Movies/ S01/ S02/  # multiple dirs to USB
+EOF
+    exit 0
+}
+
+# --- defaults ---
+mode=auto   # auto | encode | remux
+hw_mode=auto
+audio_lang="eng"
+subs_mode=strip
+subs_lang=""
+recursive=0
+dry_run=0
+output_dir=""
+inputs=()
+
+# --- parse args ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)   output_dir="$2"; shift 2 ;;
+        --remux)       mode=remux; shift ;;
+        --encode)      mode=encode; shift ;;
+        --alang)       audio_lang="$2"; shift 2 ;;
+        --hw)          hw_mode=vaapi; shift ;;
+        --sw)          hw_mode=sw; shift ;;
+        --subs)        subs_mode=burn; subs_lang="$2"; shift 2 ;;
+        --no-subs)     subs_mode=strip; shift ;;
+        -r|--recursive) recursive=1; shift ;;
+        -n|--dry-run)  dry_run=1; shift ;;
+        -h|--help)     usage ;;
+        --)            shift; inputs+=("$@"); break ;;
+        -*)            echo "$PROG: unknown option: $1" >&2; exit 1 ;;
+        *)             inputs+=("$1"); shift ;;
+    esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]; then
+    echo "$PROG: no input files or directories given" >&2
+    echo "Try '$PROG --help' for usage." >&2
+    exit 1
+fi
+
+# --- check dependencies ---
+if ! command -v ffmpeg &>/dev/null; then
+    echo "$PROG: ffmpeg is required but not found" >&2
+    exit 1
+fi
+
+# --- detect VAAPI ---
+has_vaapi=0
+if [[ "$hw_mode" != "sw" ]]; then
+    if command -v vainfo &>/dev/null && vainfo 2>/dev/null | grep -q 'VAProfileH264.*VAEntrypointEncSlice'; then
+        has_vaapi=1
+    fi
+fi
+
+if [[ "$hw_mode" == "vaapi" && "$has_vaapi" -eq 0 ]]; then
+    echo "$PROG: --hw requested but VAAPI H.264 encoding not available" >&2
+    exit 1
+fi
+
+use_vaapi=0
+if [[ "$mode" != "remux" && "$hw_mode" != "sw" && "$has_vaapi" -eq 1 ]]; then
+    use_vaapi=1
+fi
+
+# --- collect video files ---
+is_video() {
+    local ext="${1##*.}"
+    [[ "$ext" =~ ^($VIDEO_EXTS)$ ]]
+}
+
+files=()
+
+collect_files() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        if is_video "$path"; then
+            files+=("$(realpath "$path")")
+        else
+            echo "$PROG: skipping non-video file: $path" >&2
+        fi
+    elif [[ -d "$path" ]]; then
+        local depth_args=(-maxdepth 1)
+        if [[ "$recursive" -eq 1 ]]; then
+            depth_args=()
+        fi
+        while IFS= read -r -d '' f; do
+            if is_video "$f"; then
+                files+=("$f")
+            fi
+        done < <(find "$path" "${depth_args[@]}" -type f -print0 | sort -z)
+    else
+        echo "$PROG: not found: $path" >&2
+        exit 1
+    fi
+}
+
+for input in "${inputs[@]}"; do
+    collect_files "$input"
+done
+
+if [[ ${#files[@]} -eq 0 ]]; then
+    echo "$PROG: no video files found" >&2
+    exit 1
+fi
+
+echo "Found ${#files[@]} video file(s) to convert"
+case "$mode" in
+    auto)
+        echo "Mode: auto (copy compatible streams, re-encode others)"
+        ;;
+    encode)
+        if [[ "$use_vaapi" -eq 1 ]]; then
+            echo "Mode: re-encode to H.264 8-bit + stereo AAC (VAAPI hardware)"
+        else
+            echo "Mode: re-encode to H.264 8-bit + stereo AAC (software)"
+        fi
+        ;;
+    remux)
+        echo "Mode: remux (fast stream copy, audio downmixed to stereo AAC)"
+        ;;
+esac
+echo
+
+# --- slugify filename ---
+slugify() {
+    local name="$1"
+    name="${name,,}"                       # lowercase
+    name="${name//[^a-z0-9.]/-}"           # non-alphanumeric (except dots) → hyphen
+    name="$(echo "$name" | sed 's/-\+/-/g; s/^-//; s/-\././; s/-$//')"  # collapse/trim hyphens
+    echo "$name"
+}
+
+# --- convert ---
+converted=0
+failed=0
+
+convert_file() {
+    local src="$1"
+    local src_dir src_base dst_dir dst
+
+    src_dir="$(dirname "$src")"
+    src_base="$(basename "$src")"
+    dst_base="$(slugify "${src_base%.*}").mp4"
+
+    if [[ -n "$output_dir" ]]; then
+        dst_dir="$output_dir"
+    else
+        dst_dir="$HOME/PROJECTOR"
+    fi
+
+    mkdir -p "$dst_dir"
+    dst="$dst_dir/$dst_base"
+
+    if [[ -f "$dst" ]]; then
+        echo "SKIP (exists): $dst_base"
+        return 0
+    fi
+
+    # --- per-file codec detection ---
+    local video_codec video_pixfmt copy_video=0
+    video_codec=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=codec_name -of csv=p=0 "$src" 2>/dev/null)
+    video_pixfmt=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=pix_fmt -of csv=p=0 "$src" 2>/dev/null)
+
+    # resolve audio stream index (relative to audio streams)
+    local audio_stream="a:0"
+    if [[ -n "$audio_lang" ]]; then
+        local audio_count
+        audio_count=$(ffprobe -v error -select_streams a \
+            -show_entries stream=index -of csv=p=0 "$src" 2>/dev/null | wc -l)
+        if [[ "$audio_count" -gt 1 ]]; then
+            local audio_rel_idx
+            audio_rel_idx=$(ffprobe -v error -select_streams a \
+                -show_entries stream_tags=language \
+                -of csv=p=0 "$src" 2>/dev/null \
+                | grep -n "^${audio_lang}$" | head -1 | cut -d: -f1)
+            if [[ -n "$audio_rel_idx" ]]; then
+                audio_stream="a:$((audio_rel_idx - 1))"
+                echo "  Audio: selected $audio_lang track ($audio_stream)"
+            else
+                echo "  Warning: no '$audio_lang' audio track found, using first audio" >&2
+            fi
+        fi
+    fi
+
+    local audio_codec audio_channels copy_audio=0
+    audio_codec=$(ffprobe -v error -select_streams "$audio_stream" \
+        -show_entries stream=codec_name -of csv=p=0 "$src" 2>/dev/null)
+    audio_channels=$(ffprobe -v error -select_streams "$audio_stream" \
+        -show_entries stream=channels -of csv=p=0 "$src" 2>/dev/null)
+
+    # decide whether to copy or re-encode video
+    case "$mode" in
+        remux)   copy_video=1 ;;
+        encode)  copy_video=0 ;;
+        auto)
+            if [[ "$video_codec" == "h264" && "$video_pixfmt" == "yuv420p" \
+                    && "$subs_mode" != "burn" ]]; then
+                copy_video=1
+            fi
+            ;;
+    esac
+
+    # decide whether to copy or re-encode audio
+    if [[ "$audio_codec" == "aac" && "${audio_channels:-0}" -le 2 ]]; then
+        copy_audio=1
+    fi
+
+    if [[ "$dry_run" -eq 1 ]]; then
+        local actions=()
+        [[ "$copy_video" -eq 1 ]] && actions+=("copy video") || actions+=("re-encode video")
+        [[ "$copy_audio" -eq 1 ]] && actions+=("copy audio") || actions+=("re-encode audio")
+        echo "WOULD convert: $src_base -> $dst (${actions[*]})"
+        return 0
+    fi
+
+    # status line
+    local action_desc
+    if [[ "$copy_video" -eq 1 && "$copy_audio" -eq 1 ]]; then
+        action_desc="remux"
+    elif [[ "$copy_video" -eq 1 ]]; then
+        action_desc="copy video, re-encode audio"
+    elif [[ "$copy_audio" -eq 1 ]]; then
+        action_desc="re-encode video, copy audio"
+    else
+        action_desc="re-encode"
+    fi
+    echo "Converting ($action_desc): $src_base"
+
+    local tmp="$dst_dir/.converting_${dst_base}"
+    local cmd=(ffmpeg -y -hide_banner -loglevel warning -stats)
+
+    # input — only use VAAPI hwaccel when re-encoding video
+    if [[ "$copy_video" -eq 0 && "$use_vaapi" -eq 1 ]]; then
+        cmd+=(-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi)
+    fi
+    cmd+=(-i "$src")
+
+    # map streams
+    cmd+=(-map 0:v:0 -map "0:${audio_stream}")
+
+    # subtitle handling
+    if [[ "$subs_mode" == "burn" ]]; then
+        # find subtitle stream index for the requested language
+        local sub_idx
+        sub_idx=$(ffprobe -v error -select_streams s \
+            -show_entries stream=index:stream_tags=language \
+            -of csv=p=0 "$src" 2>/dev/null \
+            | grep ",$subs_lang" | head -1 | cut -d, -f1)
+
+        if [[ -n "$sub_idx" ]]; then
+            if [[ "$copy_video" -eq 1 ]]; then
+                echo "  Note: burning subs requires re-encoding video"
+            fi
+            local sub_stream
+            sub_stream=$(ffprobe -v error -select_streams s \
+                -show_entries stream=index:stream_tags=language \
+                -of csv=p=0 "$src" 2>/dev/null \
+                | grep ",$subs_lang" | head -1)
+            local abs_idx="${sub_stream%%,*}"
+            local rel_idx
+            rel_idx=$(ffprobe -v error -select_streams s \
+                -show_entries stream=index:stream_tags=language \
+                -of csv=p=0 "$src" 2>/dev/null \
+                | grep -n "^${abs_idx}," | cut -d: -f1)
+            rel_idx=$((rel_idx - 1))
+
+            if [[ "$use_vaapi" -eq 1 ]]; then
+                cmd+=(-vf "hwdownload,format=nv12,subtitles='${src//\'/\\\'}':si=${rel_idx},hwupload")
+                cmd+=(-c:v h264_vaapi -qp 22)
+            else
+                cmd+=(-vf "subtitles='${src//\'/\\\'}':si=${rel_idx}")
+                cmd+=(-c:v libx264 -crf 20 -preset medium)
+            fi
+        else
+            echo "  Warning: no '$subs_lang' subtitle track found, skipping burn-in"
+            cmd+=(-sn)
+            if [[ "$copy_video" -eq 1 ]]; then
+                cmd+=(-c:v copy)
+            elif [[ "$use_vaapi" -eq 1 ]]; then
+                cmd+=(-c:v h264_vaapi -qp 22)
+            else
+                cmd+=(-c:v libx264 -crf 20 -preset medium)
+            fi
+        fi
+    else
+        # no subtitles
+        cmd+=(-sn)
+        if [[ "$copy_video" -eq 1 ]]; then
+            cmd+=(-c:v copy)
+        elif [[ "$use_vaapi" -eq 1 ]]; then
+            cmd+=(-vf 'hwdownload,format=nv12,hwupload')
+            cmd+=(-c:v h264_vaapi -qp 22)
+        else
+            cmd+=(-pix_fmt yuv420p)
+            cmd+=(-c:v libx264 -crf 20 -preset medium)
+        fi
+    fi
+
+    # audio
+    if [[ "$copy_audio" -eq 1 ]]; then
+        cmd+=(-c:a copy)
+    else
+        cmd+=(-c:a aac -b:a 192k -ac 2)
+    fi
+
+    cmd+=(-movflags +faststart "$tmp")
+
+    if "${cmd[@]}"; then
+        mv "$tmp" "$dst"
+        echo "  -> $dst_base"
+        return 0
+    else
+        rm -f "$tmp"
+        echo "  FAILED: $src_base" >&2
+        return 1
+    fi
+}
+
+for f in "${files[@]}"; do
+    if convert_file "$f"; then
+        ((++converted))
+    else
+        ((++failed))
+    fi
+done
+
+echo
+echo "Done: $converted converted, $failed failed, ${#files[@]} total"
