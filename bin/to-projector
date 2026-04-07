@@ -57,6 +57,7 @@ Options:
   --subs LANG          Burn in subtitles for given language (e.g. "eng", "spa")
   --no-subs            Strip all subtitles (default)
   -r, --recursive      Recurse into subdirectories
+  -f, --force          Overwrite existing output files
   -n, --dry-run        Show what would be done without doing it
   -h, --help           Show this help
 
@@ -80,6 +81,7 @@ audio_lang="eng"
 subs_mode=strip
 subs_lang=""
 recursive=0
+force=0
 dry_run=0
 output_dir=""
 inputs=()
@@ -96,6 +98,7 @@ while [[ $# -gt 0 ]]; do
         --subs)        subs_mode=burn; subs_lang="$2"; shift 2 ;;
         --no-subs)     subs_mode=strip; shift ;;
         -r|--recursive) recursive=1; shift ;;
+        -f|--force)    force=1; shift ;;
         -n|--dry-run)  dry_run=1; shift ;;
         -h|--help)     usage ;;
         --)            shift; inputs+=("$@"); break ;;
@@ -223,7 +226,7 @@ convert_file() {
     mkdir -p "$dst_dir"
     dst="$dst_dir/$dst_base"
 
-    if [[ -f "$dst" ]]; then
+    if [[ -f "$dst" && "$force" -eq 0 ]]; then
         echo "SKIP (exists): $dst_base"
         return 0
     fi
