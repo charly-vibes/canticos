@@ -18,12 +18,12 @@ Written in TypeScript, compiled to GJS-compatible JavaScript, and installed as a
 | Zoom         | Uses GNOME's built-in screen magnifier     |
 | Undo         | Ctrl+Z to undo last stroke                 |
 | 5 colors     | Red, Blue, Green, Yellow, White (keys 1–5) |
-| 4 line widths| Cycle with toolbar button                  |
+| 4 line widths| Cycle with W key or toolbar button (2, 4, 7, 12) |
 | Configurable hotkey | Change the activation shortcut via Extensions preferences |
 
 ## Requirements
 
-- GNOME Shell 45, 46, 47, or 48
+- GNOME Shell 45–49
 - Node.js 18+ (build only)
 - `glib-compile-schemas` (usually pre-installed)
 
@@ -59,6 +59,7 @@ gnome-extensions enable anatomico@local
 | `R`        | Rectangle tool       |
 | `E`        | Ellipse tool         |
 | `T`        | Text tool            |
+| `W`        | Cycle line width     |
 | `1`–`5`    | Switch color         |
 | `+` / `-`  | Zoom in / out        |
 | `Ctrl+Z`   | Undo last stroke     |
@@ -100,11 +101,13 @@ npm run check
 journalctl -f -o cat /usr/bin/gnome-shell
 ```
 
+Note: on Wayland, code changes require a log out/in for GNOME Shell to pick them up. The `npm run dev` script disables and re-enables the extension, which works for some changes but not all.
+
 ## How It Works
 
-The extension creates a fullscreen transparent `St.DrawingArea` overlay using `Main.layoutManager.addTopChrome()`. Because this runs inside GNOME Shell's Mutter compositor, it works natively on Wayland — no layer-shell protocol needed.
+The extension creates a fullscreen transparent overlay (`St.Widget`) with a `St.DrawingArea` canvas using `Main.layoutManager.addTopChrome()`. Because this runs inside GNOME Shell's Mutter compositor, it works natively on Wayland — no layer-shell protocol needed.
 
-Drawing is done via Cairo on the `St.DrawingArea` repaint signal. Strokes are stored as typed data structures and re-rendered on each frame. Zoom leverages GNOME's built-in accessibility magnifier via `org.gnome.desktop.a11y.magnifier` GSettings.
+Input events (mouse, keyboard) are handled on the overlay widget, while the `DrawingArea` is non-reactive and used only for Cairo rendering. Strokes are stored as typed data structures and re-rendered on each repaint. Zoom leverages GNOME's built-in accessibility magnifier via `org.gnome.desktop.a11y.magnifier` GSettings.
 
 ## License
 

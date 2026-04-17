@@ -173,6 +173,7 @@ declare module 'gi://Clutter' {
   export const KEY_r: number;
   export const KEY_e: number;
   export const KEY_t: number;
+  export const KEY_w: number;
   export const KEY_plus: number;
   export const KEY_minus: number;
   export const KEY_equal: number;

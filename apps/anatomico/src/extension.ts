@@ -100,6 +100,7 @@ export default class Anatomico extends Extension {
   private _toolbar: St.BoxLayout | null = null;
   private _toolButtons: Map<ToolType, St.Button> = new Map();
   private _colorButtons: Map<number, St.Button> = new Map();
+  private _widthBtn: St.Button | null = null;
   private _statusLabel: St.Label | null = null;
   private _textEntry: St.Entry | null = null;
 
@@ -295,13 +296,14 @@ export default class Anatomico extends Extension {
       const c = COLORS[i];
       const cssColor = `rgba(${c.rgba[0] * 255},${c.rgba[1] * 255},${c.rgba[2] * 255},1)`;
       const btn = new St.Button({
-        label: ' ',
+        label: `${i + 1}`,
         style: `
           background-color: ${cssColor};
           min-width: 22px; min-height: 22px;
           border-radius: 11px;
           border: 2px solid ${i === this._colorIndex ? 'white' : 'rgba(255,255,255,0.2)'};
           margin: 2px;
+          font-size: 10px; color: rgba(0,0,0,0.5); text-align: center;
         `,
         reactive: true,
         can_focus: false,
@@ -319,22 +321,18 @@ export default class Anatomico extends Extension {
     }));
 
     // Width button
-    const widthBtn = new St.Button({
-      label: `W: ${this._currentLineWidth}`,
+    this._widthBtn = new St.Button({
+      label: `W: ${this._currentLineWidth} (W)`,
       style: this._actionBtnStyle(),
       reactive: true,
       can_focus: false,
     });
-    widthBtn.connect('clicked', () => {
-      this._widthIndex = (this._widthIndex + 1) % LINE_WIDTHS.length;
-      this._currentLineWidth = LINE_WIDTHS[this._widthIndex];
-      widthBtn.label = `W: ${this._currentLineWidth}`;
-    });
-    this._toolbar.add_child(widthBtn);
+    this._widthBtn.connect('clicked', () => this._cycleWidth());
+    this._toolbar.add_child(this._widthBtn);
 
     // Zoom buttons
     const zoomInBtn = new St.Button({
-      label: 'Zoom+',
+      label: 'Zoom (+)',
       style: this._actionBtnStyle(),
       reactive: true,
       can_focus: false,
@@ -343,7 +341,7 @@ export default class Anatomico extends Extension {
     this._toolbar.add_child(zoomInBtn);
 
     const zoomOutBtn = new St.Button({
-      label: 'Zoom−',
+      label: 'Zoom (−)',
       style: this._actionBtnStyle(),
       reactive: true,
       can_focus: false,
@@ -363,7 +361,7 @@ export default class Anatomico extends Extension {
 
     // Clear
     const clearBtn = new St.Button({
-      label: 'Clear',
+      label: 'Clear (C)',
       style: this._actionBtnStyle(),
       reactive: true,
       can_focus: false,
@@ -426,6 +424,7 @@ export default class Anatomico extends Extension {
         border-radius: 11px;
         border: 2px solid ${i === index ? 'white' : 'rgba(255,255,255,0.2)'};
         margin: 2px;
+        font-size: 10px; color: rgba(0,0,0,0.5); text-align: center;
       `;
     }
     this._overlay?.grab_key_focus();
@@ -561,6 +560,9 @@ export default class Anatomico extends Extension {
     if (sym === Clutter.KEY_e) { this._selectTool('ellipse'); return Clutter.EVENT_STOP; }
     if (sym === Clutter.KEY_t) { this._selectTool('text');    return Clutter.EVENT_STOP; }
 
+    // Width cycle
+    if (sym === Clutter.KEY_w) { this._cycleWidth(); return Clutter.EVENT_STOP; }
+
     // Clear
     if (sym === Clutter.KEY_c && !ctrl) { this._clearAll(); return Clutter.EVENT_STOP; }
 
@@ -659,6 +661,12 @@ export default class Anatomico extends Extension {
     this._strokes = [];
     this._currentStroke = null;
     this._canvas?.queue_repaint();
+  }
+
+  private _cycleWidth(): void {
+    this._widthIndex = (this._widthIndex + 1) % LINE_WIDTHS.length;
+    this._currentLineWidth = LINE_WIDTHS[this._widthIndex];
+    if (this._widthBtn) this._widthBtn.label = `W: ${this._currentLineWidth} (W)`;
   }
 
   // ── Zoom (GNOME built-in magnifier) ────────────────────────────
