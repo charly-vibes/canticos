@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.anatomico"
+          path="/org/gnome/shell/extensions/anatomico/">
+    <key name="toggle-anatomico" type="as">
+      <default>['&lt;Super&gt;z']</default>
+      <summary>Toggle Anatómico overlay</summary>
+      <description>
+        Keyboard shortcut to activate/deactivate the annotation overlay.
+      </description>
+    </key>
+  </schema>
+</schemalist>

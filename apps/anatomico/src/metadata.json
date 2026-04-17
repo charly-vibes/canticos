@@ -1,0 +1,9 @@
+{
+  "name": "Anatómico",
+  "description": "Quiero un zoom anatómico — draw, annotate, and zoom on your screen",
+  "uuid": "anatomico@local",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "settings-schema": "org.gnome.shell.extensions.anatomico",
+  "url": "",
+  "version": 1
+}

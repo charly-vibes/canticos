@@ -2,6 +2,12 @@
 
 Cánticos, invocaciones, escrituras — scripts de uso personal.
 
+## Apps
+
+| App | Descripción |
+|---|---|
+| [`anatomico`](apps/anatomico/) | *Quiero un zoom anatómico* — clon de ZoomIt para GNOME Shell, nativo en Wayland |
+
 ## Scripts
 
 | Script | Descripción |

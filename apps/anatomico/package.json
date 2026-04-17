@@ -1,0 +1,17 @@
+{
+  "name": "anatomico",
+  "version": "1.0.0",
+  "description": "Quiero un zoom anatómico — GNOME Shell annotation overlay (Wayland-native)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node build.mjs",
+    "install-ext": "node build.mjs && bash install.sh",
+    "dev": "node build.mjs && bash install.sh && gnome-extensions disable anatomico@local 2>/dev/null; gnome-extensions enable anatomico@local"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}
