@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { cpSync, mkdirSync } from 'fs';
+import { cpSync, mkdirSync, existsSync } from 'fs';
 
 const DIST = 'dist';
 mkdirSync(DIST, { recursive: true });
@@ -18,5 +18,9 @@ await build({
 });
 
 cpSync('src/metadata.json', `${DIST}/metadata.json`);
+
+if (existsSync('src/schemas')) {
+  cpSync('src/schemas', `${DIST}/schemas`, { recursive: true });
+}
 
 console.log('✓ Built to dist/');

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.vitral"
+          path="/org/gnome/shell/extensions/vitral/">
+    <key name="toggle-transparency" type="as">
+      <default>['&lt;Control&gt;0']</default>
+      <summary>Toggle Ptyxis transparency</summary>
+      <description>Toggle the Ptyxis terminal opacity between transparent and opaque</description>
+    </key>
+    <key name="increase-opacity" type="as">
+      <default>['&lt;Control&gt;9']</default>
+      <summary>Increase opacity (less transparent)</summary>
+      <description>Increase Ptyxis opacity by 0.05</description>
+    </key>
+    <key name="decrease-opacity" type="as">
+      <default>['&lt;Control&gt;8']</default>
+      <summary>Decrease opacity (more transparent)</summary>
+      <description>Decrease Ptyxis opacity by 0.05</description>
+    </key>
+  </schema>
+</schemalist>
