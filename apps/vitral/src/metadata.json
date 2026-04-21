@@ -1,0 +1,8 @@
+{
+  "name": "Vitral",
+  "description": "Keep Ptyxis transparent in fullscreen by redirecting to maximized",
+  "uuid": "vitral@local",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "",
+  "version": 1
+}

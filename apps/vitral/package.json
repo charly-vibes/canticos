@@ -1,0 +1,17 @@
+{
+  "name": "vitral",
+  "version": "1.0.0",
+  "description": "Keep Ptyxis transparent in fullscreen",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node build.mjs",
+    "install-ext": "node build.mjs && bash install.sh",
+    "dev": "node build.mjs && bash install.sh && gnome-extensions disable vitral@local 2>/dev/null; gnome-extensions enable vitral@local"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}
