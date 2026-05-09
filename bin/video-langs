@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# video-langs — Show audio, subtitle, and video stream languages in a video file
+#
+# DESCRIPTION
+#   Uses ffprobe to list all streams in one or more video files, grouped by
+#   type (video, audio, subtitle). Shows codec, language, and title for each
+#   stream — useful for picking --alang / --subs values before running
+#   to-projector.
+#
+# DEPENDENCIES
+#   ffprobe (part of ffmpeg), jq
+#
+# EXIT CODES
+#   0   Success
+#   1   Error (missing file, missing dependency)
+
+readonly PROG="$(basename "$0")"
+
+usage() {
+    cat <<EOF
+Usage: $PROG <file> [file ...]
+
+Show audio, subtitle, and video stream languages for video files.
+
+Options:
+  -h, --help    Show this help
+
+Examples:
+  $PROG movie.mkv
+  $PROG *.mkv
+  $PROG -- -oddly-named.mkv
+EOF
+    exit 0
+}
+
+inputs=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage ;;
+        --)        shift; inputs+=("$@"); break ;;
+        -*)        echo "$PROG: unknown option: $1" >&2; exit 1 ;;
+        *)         inputs+=("$1"); shift ;;
+    esac
+done
+
+if [[ ${#inputs[@]} -eq 0 ]]; then
+    echo "$PROG: no input files given" >&2
+    echo "Try '$PROG --help' for usage." >&2
+    exit 1
+fi
+
+for dep in ffprobe jq; do
+    if ! command -v "$dep" &>/dev/null; then
+        echo "$PROG: $dep is required but not found" >&2
+        exit 1
+    fi
+done
+
+probe_file() {
+    local file="$1"
+
+    if [[ -d "$file" ]]; then
+        echo "$PROG: $file: is a directory — use a glob instead (e.g. '$PROG \"$file\"/*.mkv')" >&2
+        return 1
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        echo "$PROG: not found: $file" >&2
+        return 1
+    fi
+
+    echo "==> $(basename "$file")"
+
+    # Use JSON output to avoid fragile positional CSV column assumptions
+    local streams
+    streams=$(ffprobe -v error -show_streams -print_format json "$file" \
+        | jq -r '.streams[] | "\(.index)|\(.codec_name // "unknown")|\(.codec_type // "")|\(.tags.language // "und")|\(.tags.title // "")"')
+
+    if [[ -z "$streams" ]]; then
+        echo "  (no streams found)"
+        echo
+        return 0
+    fi
+
+    local current_type="" index codec_name codec_type lang title label
+
+    while IFS='|' read -r index codec_name codec_type lang title; do
+        [[ -z "$index" ]] && continue
+        [[ -z "$codec_type" ]] && continue
+        if [[ "$codec_type" != "$current_type" ]]; then
+            printf "\n  [%s]\n" "${codec_type^^}"
+            current_type="$codec_type"
+        fi
+        label="    stream #${index}  codec=${codec_name}  lang=${lang}"
+        [[ -n "$title" ]] && label+="  title=${title}"
+        echo "$label"
+    done <<< "$streams"
+
+    echo
+}
+
+exit_code=0
+for f in "${inputs[@]}"; do
+    probe_file "$f" || exit_code=1
+done
+
+exit "$exit_code"
