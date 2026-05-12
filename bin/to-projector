@@ -121,9 +121,11 @@ fi
 
 # --- detect VAAPI ---
 has_vaapi=0
+vaapi_device=""
 if [[ "$hw_mode" != "sw" ]]; then
     if command -v vainfo &>/dev/null && vainfo 2>/dev/null | grep -q 'VAProfileH264.*VAEntrypointEncSlice'; then
         has_vaapi=1
+        vaapi_device=$(ls /dev/dri/renderD* 2>/dev/null | head -1)
     fi
 fi
 
@@ -306,10 +308,10 @@ convert_file() {
     local tmp="$dst_dir/.converting_${dst_base}"
     local cmd=(ffmpeg -y -hide_banner -loglevel warning -stats)
 
-    # input — only use VAAPI hwaccel when re-encoding video
-    if [[ "$copy_video" -eq 0 && "$use_vaapi" -eq 1 ]]; then
-        cmd+=(-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi)
+    if [[ "$use_vaapi" -eq 1 && -n "$vaapi_device" ]]; then
+        cmd+=(-vaapi_device "$vaapi_device")
     fi
+
     cmd+=(-i "$src")
 
     # map streams
@@ -342,7 +344,7 @@ convert_file() {
             rel_idx=$((rel_idx - 1))
 
             if [[ "$use_vaapi" -eq 1 ]]; then
-                cmd+=(-vf "hwdownload,format=nv12,subtitles='${src//\'/\\\'}':si=${rel_idx},hwupload")
+                cmd+=(-vf "subtitles='${src//\'/\\\'}':si=${rel_idx},format=nv12,hwupload")
                 cmd+=(-c:v h264_vaapi -qp 22)
             else
                 cmd+=(-vf "subtitles='${src//\'/\\\'}':si=${rel_idx}")
@@ -354,6 +356,7 @@ convert_file() {
             if [[ "$copy_video" -eq 1 ]]; then
                 cmd+=(-c:v copy)
             elif [[ "$use_vaapi" -eq 1 ]]; then
+                cmd+=(-vf 'format=nv12,hwupload')
                 cmd+=(-c:v h264_vaapi -qp 22)
             else
                 cmd+=(-c:v libx264 -crf 20 -preset medium)
@@ -365,7 +368,7 @@ convert_file() {
         if [[ "$copy_video" -eq 1 ]]; then
             cmd+=(-c:v copy)
         elif [[ "$use_vaapi" -eq 1 ]]; then
-            cmd+=(-vf 'hwdownload,format=nv12,hwupload')
+            cmd+=(-vf 'format=nv12,hwupload')
             cmd+=(-c:v h264_vaapi -qp 22)
         else
             cmd+=(-pix_fmt yuv420p)
