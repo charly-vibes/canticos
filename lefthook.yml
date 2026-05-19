@@ -1,0 +1,25 @@
+pre-commit:
+  commands:
+    python:
+      run: python3 -m py_compile bin/*.py
+    shell:
+      run: |
+        sh -n install
+        for f in bin/*; do
+          if head -1 "$f" | grep -Eq 'sh|bash'; then
+            sh -n "$f"
+          fi
+        done
+
+pre-push:
+  commands:
+    python:
+      run: python3 -m py_compile bin/*.py
+    shell:
+      run: |
+        sh -n install
+        for f in bin/*; do
+          if head -1 "$f" | grep -Eq 'sh|bash'; then
+            sh -n "$f"
+          fi
+        done
