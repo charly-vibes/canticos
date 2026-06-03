@@ -12,6 +12,7 @@ scripts=(
     projector-queue
     to-projector
     transcribe
+    llm-dashboard
     claude-dashboard
     ci-usage
 )

@@ -12,7 +12,8 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 
 | Script | Descripción |
 |---|---|
-| `claude-dashboard` | Dashboard HTML de uso de Claude Code |
+| `llm-dashboard` | Dashboard HTML local de uso de asistentes (Claude Code + Pi) y actividad de Amp/Gemini |
+| `claude-dashboard` | Alias retrocompatible de `llm-dashboard` |
 | `projector-queue` | Procesa una cola de videos a través de `to-projector` |
 | `to-projector` | Convierte video a MP4 compatible con proyector (H.264 + AAC estéreo) |
 | `transcribe` | Transcribe audio a texto con whisper-cli |
