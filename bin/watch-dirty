@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+watch-dirty — monitor /proc/meminfo Dirty pages with ETA estimation.
+
+Tracks how fast dirty-page memory is being consumed or drained
+and estimates when it will reach zero (or a user-specified target).
+
+Usage:
+  watch-dirty                  # default: estimate time to 0
+  watch-dirty 4096             # estimate time to reach 4096 kB
+  watch-dirty --window 15      # use a 15-sample rolling window
+  watch-dirty 50000 --window 20  # custom target & wider window
+"""
+
+import argparse
+import os
+import re
+import sys
+import time
+from collections import deque
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+DIRTY_RE = re.compile(rb"^Dirty:\s+(\d+)\s+kB")
+
+
+def read_dirty() -> int | None:
+    """Return current Dirty value in kB, or None on error."""
+    try:
+        with open("/proc/meminfo", "rb") as fh:
+            for line in fh:
+                m = DIRTY_RE.match(line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        pass
+    return None
+
+
+def fmt_kb(kb: int) -> str:
+    """Format kilobytes into a human-friendly string."""
+    if kb < 1024:
+        return f"{kb} kB"
+    if kb < 1024 * 1024:
+        return f"{kb / 1024:.1f} MB"
+    return f"{kb / 1024 / 1024:.1f} GB"
+
+
+def fmt_duration(seconds: float) -> str:
+    """Format seconds as a human-friendly duration string."""
+    if seconds < 0:
+        return "—"
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{minutes:.0f}m {seconds % 60:.0f}s"
+    hours = minutes / 60
+    return f"{hours:.0f}h {minutes % 60:.0f}m"
+
+
+def fmt_time(t: float) -> str:
+    """Format a unix timestamp as HH:MM:SS."""
+    return time.strftime("%H:%M:%S", time.localtime(t))
+
+
+def clear_screen() -> None:
+    """Clear terminal and move cursor home."""
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+# ── main ─────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Monitor /proc/meminfo Dirty pages with ETA estimation.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument(
+        "target",
+        nargs="?",
+        type=int,
+        default=0,
+        help="Target Dirty value in kB (default: 0)",
+    )
+    p.add_argument(
+        "--window",
+        "-w",
+        type=int,
+        default=10,
+        help="Number of samples for the rolling rate window (default: 10)",
+    )
+    p.add_argument(
+        "--interval",
+        "-i",
+        type=float,
+        default=1.0,
+        help="Polling interval in seconds (default: 1.0)",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    target = args.target
+    window_size = max(2, args.window)
+    interval = max(0.1, args.interval)
+
+    # Rolling history of (timestamp, dirty_kb)
+    history: deque[tuple[float, int]] = deque(maxlen=window_size)
+
+    # Track first sample time for overall duration
+    first_ts: float | None = None
+
+    # Track the minimum value seen (for progress toward zero)
+    min_seen: int | None = None
+
+    # Screen-clearing count so we don't flicker on every tick
+    tick = 0
+
+    print(f" Watching Dirty pages  •  target: {fmt_kb(target)}  •  window: {window_size}s")
+    print()
+
+    while True:
+        now = time.time()
+        value = read_dirty()
+
+        if value is None:
+            clear_screen()
+            print("⚠  Could not read /proc/meminfo")
+            time.sleep(interval)
+            continue
+
+        history.append((now, value))
+        if first_ts is None:
+            first_ts = now
+        if min_seen is None or value < min_seen:
+            min_seen = value
+
+        # ── compute rate (kB/s) from rolling window ──────
+        rate: float = 0.0
+        if len(history) >= 2:
+            oldest_ts, oldest_val = history[0]
+            elapsed = now - oldest_ts
+            if elapsed > 0:
+                rate = (value - oldest_val) / elapsed
+
+        # ── estimate time remaining ──────────────────────
+        eta_str = "—"
+        remaining_str = "—"
+        kbdiff = value - target
+
+        if rate < 0:
+            # Decreasing → estimate time to reach target
+            if kbdiff > 0:
+                est_seconds = kbdiff / abs(rate)
+                eta_ts = now + est_seconds
+                remaining_str = fmt_duration(est_seconds)
+                eta_str = fmt_time(eta_ts)
+            elif kbdiff <= 0:
+                remaining_str = "done ✓"
+                eta_str = fmt_time(now)
+        elif rate > 0:
+            remaining_str = "↑ rising"
+        elif rate == 0 and kbdiff > 0 and len(history) >= window_size:
+            remaining_str = "steady"
+        elif len(history) < window_size:
+            remaining_str = "warming…"
+
+        # ── screen output ────────────────────────────────
+        if tick % 30 == 0:
+            clear_screen()
+            header = (
+                f"  {'Value':>10}  {'Δ/s':>9}  {'Min':>10}  {'Remaining':>12}  "
+                f"{'ETA':>8}  {'Samples':>7}"
+            )
+            print(f" Watching Dirty pages  •  target: {fmt_kb(target)}  •  window: {window_size}s")
+            print()
+            print(header)
+            print("  " + "─" * (len(header) - 4))
+
+        # Format rate with sign
+        rate_str = f"{rate:+.1f}" if rate != 0 else "  0.0"
+        # Add a visual direction indicator
+        if rate < -50:
+            dir_ind = " ⬇⬇"
+        elif rate < -5:
+            dir_ind = " ⬇ "
+        elif rate > 50:
+            dir_ind = " ⬆⬆"
+        elif rate > 5:
+            dir_ind = " ⬆ "
+        else:
+            dir_ind = "  · "
+
+        remaining_pad = remaining_str.rjust(12)
+        eta_pad = eta_str.rjust(8)
+
+        line = (
+            f"  {fmt_kb(value):>10}  {rate_str:>8}{dir_ind}  "
+            f"{fmt_kb(min_seen):>10}  {remaining_pad}  "
+            f"{eta_pad}  {len(history):>4}/{window_size:<1}"
+        )
+        print(line)
+
+        tick += 1
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)
