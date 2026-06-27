@@ -234,11 +234,17 @@ convert_file() {
     fi
 
     # --- per-file codec detection ---
-    local video_codec video_pixfmt copy_video=0
-    video_codec=$(ffprobe -v error -select_streams v:0 \
-        -show_entries stream=codec_name -of csv=p=0 "$src" 2>/dev/null)
-    video_pixfmt=$(ffprobe -v error -select_streams v:0 \
-        -show_entries stream=pix_fmt -of csv=p=0 "$src" 2>/dev/null)
+    local video_codec video_pixfmt copy_video=0 probe_mmco=0
+    local probe_data
+    probe_data=$(ffprobe -v warning -select_streams v:0 \
+        -show_entries stream=codec_name,pix_fmt -of csv=p=0 "$src" 2>/tmp/mmco_check_$$)
+    video_codec=$(echo "$probe_data" | cut -d, -f1)
+    video_pixfmt=$(echo "$probe_data" | cut -d, -f2)
+    if grep -q "mmco" /tmp/mmco_check_$$ 2>/dev/null; then
+        probe_mmco=1
+        echo "  Warning: source has H.264 MMCO errors, will re-encode" >&2
+    fi
+    rm -f /tmp/mmco_check_$$
 
     # resolve audio stream index (relative to audio streams)
     local audio_stream="a:0"
@@ -273,8 +279,10 @@ convert_file() {
         encode)  copy_video=0 ;;
         auto)
             if [[ "$video_codec" == "h264" && "$video_pixfmt" == "yuv420p" \
-                    && "$subs_mode" != "burn" ]]; then
+                    && "$subs_mode" != "burn" && "$probe_mmco" -eq 0 ]]; then
                 copy_video=1
+            elif [[ "$probe_mmco" -eq 1 ]]; then
+                echo "  Auto: falling back to re-encode (source has H.264 stream issues)"
             fi
             ;;
     esac
@@ -345,7 +353,7 @@ convert_file() {
 
             if [[ "$use_vaapi" -eq 1 ]]; then
                 cmd+=(-vf "subtitles='${src//\'/\\\'}':si=${rel_idx},format=nv12,hwupload")
-                cmd+=(-c:v h264_vaapi -qp 22)
+                cmd+=(-c:v h264_vaapi -qp 22 -level 40)
             else
                 cmd+=(-vf "subtitles='${src//\'/\\\'}':si=${rel_idx}")
                 cmd+=(-c:v libx264 -crf 20 -preset medium)
@@ -357,7 +365,7 @@ convert_file() {
                 cmd+=(-c:v copy)
             elif [[ "$use_vaapi" -eq 1 ]]; then
                 cmd+=(-vf 'format=nv12,hwupload')
-                cmd+=(-c:v h264_vaapi -qp 22)
+                cmd+=(-c:v h264_vaapi -qp 22 -level 40)
             else
                 cmd+=(-c:v libx264 -crf 20 -preset medium)
             fi
@@ -369,7 +377,7 @@ convert_file() {
             cmd+=(-c:v copy)
         elif [[ "$use_vaapi" -eq 1 ]]; then
             cmd+=(-vf 'format=nv12,hwupload')
-            cmd+=(-c:v h264_vaapi -qp 22)
+            cmd+=(-c:v h264_vaapi -qp 22 -level 40)
         else
             cmd+=(-pix_fmt yuv420p)
             cmd+=(-c:v libx264 -crf 20 -preset medium)
