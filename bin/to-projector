@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# to-projector — Convert video files to projector-compatible MP4
+# to-projector — Convert video files to projector-compatible MKV
 #
 # DESCRIPTION
-#   Converts video files (MKV, AVI, WebM, etc.) into MP4 files suitable for
+#   Converts video files (MKV, AVI, WebM, etc.) into MKV files suitable for
 #   USB playback on MAGCubic and similar Android-based portable projectors.
 #
 #   Auto-detects per file whether re-encoding is needed. If the video is
@@ -45,7 +45,7 @@ usage() {
     cat <<EOF
 Usage: $PROG [options] <file|dir> [file|dir ...]
 
-Convert video files to projector-friendly MP4.
+Convert video files to projector-friendly MKV.
 
 Options:
   -o, --output DIR     Output directory (default: ~/PROJECTOR)
@@ -62,7 +62,7 @@ Options:
   -h, --help           Show this help
 
 Examples:
-  $PROG movie.mkv                       # convert to ~/PROJECTOR/movie.mp4
+  $PROG movie.mkv                       # convert to ~/PROJECTOR/movie.mkv
   $PROG ~/Videos/                       # convert all videos in dir
   $PROG -o /mnt/usb/ *.mkv             # output to USB drive
   $PROG --subs eng show/               # burn English subs
@@ -217,7 +217,7 @@ convert_file() {
 
     src_dir="$(dirname "$src")"
     src_base="$(basename "$src")"
-    dst_base="$(slugify "${src_base%.*}").mp4"
+    dst_base="$(slugify "${src_base%.*}").mkv"
 
     if [[ -n "$output_dir" ]]; then
         dst_dir="$output_dir"
@@ -391,7 +391,7 @@ convert_file() {
         cmd+=(-c:a aac -b:a 192k -ac 2)
     fi
 
-    cmd+=(-movflags +faststart "$tmp")
+    cmd+=("$tmp")
 
     if "${cmd[@]}"; then
         mv "$tmp" "$dst"
