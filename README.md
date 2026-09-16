@@ -15,7 +15,7 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 | `llm-dashboard` | Dashboard HTML local de uso de asistentes (Claude Code + Pi) y actividad de Amp/Gemini |
 | `claude-dashboard` | Alias retrocompatible de `llm-dashboard` |
 | `projector-queue` | Procesa una cola de videos a través de `to-projector` |
-| `to-projector` | Convierte video a MP4 compatible con proyector (H.264 + AAC estéreo) |
+| `to-projector` | Convierte video a MKV compatible con proyector (H.264 + AAC estéreo); ordena episodios en estructura Jellyfin `Show (Year)/Season NN/` |
 | `transcribe` | Transcribe audio a texto con whisper-cli |
 
 ## Instalación

@@ -28,6 +28,13 @@ set -euo pipefail
 #   A temporary file (.converting_*) is used during conversion and renamed
 #   on success, so interrupted runs won't leave corrupt output.
 #
+#   By default, episode files are sorted into Jellyfin-compatible layout:
+#   <output>/<Show Title (Year)>/Season NN/<file>.mkv, parsed from the
+#   release name (e.g. "my.show.2024.s01e05.1080p...mkv" goes to
+#   "My Show (2024)/Season 01/"). Use --no-jellyfin to write everything
+#   flat into the output directory instead. Files without a SxxEyy marker
+#   (movies) are written to the output root.
+#
 # SUPPORTED INPUT FORMATS
 #   mkv, avi, wmv, flv, webm, mov, mp4, ts, m2ts, mpg, mpeg, vob, ogv, 3gp
 #
@@ -49,6 +56,8 @@ Convert video files to projector-friendly MKV.
 
 Options:
   -o, --output DIR     Output directory (default: ~/PROJECTOR)
+  --jellyfin           Sort episodes into Show (Year)/Season NN/ (default)
+  --no-jellyfin        Write all files flat into the output directory
   --remux              Force fast copy of all streams (no re-encoding)
   --encode             Force re-encoding even if already H.264 8-bit
   --hw                 Use VAAPI hardware encoding (auto-detected by default)
@@ -76,6 +85,7 @@ EOF
 
 # --- defaults ---
 mode=auto   # auto | encode | remux
+jellyfin=1
 hw_mode=auto
 audio_lang="eng"
 subs_mode=strip
@@ -90,6 +100,8 @@ inputs=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -o|--output)   output_dir="$2"; shift 2 ;;
+        --jellyfin)    jellyfin=1; shift ;;
+        --no-jellyfin) jellyfin=0; shift ;;
         --remux)       mode=remux; shift ;;
         --encode)      mode=encode; shift ;;
         --alang)       audio_lang="$2"; shift 2 ;;
@@ -207,6 +219,66 @@ slugify() {
     echo "$name"
 }
 
+# --- title-case a spaced show name ---
+titlecase() {
+    local title="$1"
+    local small=" a an the and or of in on to at for nor but by with from into "
+    local out=() word i=0
+    for word in $title; do
+        i=$((i + 1))
+        local lower="${word,,}"
+        if [[ $i -gt 1 && "$small" == *" $lower "* ]]; then
+            out+=("$lower")
+        else
+            out+=("${lower^}")
+        fi
+    done
+    echo "${out[*]}"
+}
+
+# --- parse Jellyfin subdirectory from a release basename ---
+# Prints "Show Title (Year)/Season NN" and returns 0 if the name contains a
+# SxxEyy marker (or a bare Sxx season marker); returns 1 otherwise (movies →
+# flat output). Handles dot/space/hyphen separators, years before the marker,
+# parenthesized years, and duplicated "Season N" tokens.
+jellyfin_subdir() {
+    local base="$1"
+    local stripped title year season
+
+    # everything before the last SxxEyy token is the show name
+    stripped="$(printf '%s' "$base" | sed -nE 's/^(.*[^._ -])[._ -]+[sS][0-9]{1,2}[._ -]*[eE][0-9]{1,3}.*$/\1/p')"
+    if [[ -n "$stripped" ]]; then
+        season="$(printf '%s' "${base#"$stripped"}" | sed -nE 's/^[._ -]+[sS]([0-9]{1,2})[._ -]*[eE][0-9]{1,3}.*$/\1/p')"
+    else
+        # fall back to a bare season marker (season packs): "Show 2024 S01 ..."
+        stripped="$(printf '%s' "$base" | sed -nE 's/^(.*[^._ -])[._ -]+[sS][0-9]{1,2}([^0-9a-zA-Z].*|$)$/\1/p')"
+        [[ -n "$stripped" ]] || return 1
+        season="$(printf '%s' "${base#"$stripped"}" | sed -nE 's/^[._ -]+[sS]([0-9]{1,2})([^0-9a-zA-Z].*|$)$/\1/p')"
+    fi
+
+    # separators → spaces, collapse whitespace
+    title="$(printf '%s' "$stripped" | sed 's/[._-]\+/ /g; s/\s\+/ /g; s/^ //; s/ $//')"
+
+    # strip a duplicated "Season 01"/"S01" token that matches the real season
+    local trimmed
+    trimmed="$(printf '%s' "$title" | sed -E "s/[._ -]+[sS](eason)?0?${season}$//")"
+    [[ -n "$trimmed" ]] && title="$trimmed"
+
+    # year in the name → used as the (Year) disambiguator
+    if [[ "$title" =~ \(?(19[0-9]{2}|20[0-9]{2})\)?$ ]]; then
+        year="${BASH_REMATCH[1]}"
+        title="${title%(*}"   # cut " (2019)" or " 2019" tail
+        title="${title%$year}" # bare-year case
+        title="${title% }"
+    fi
+    # drop any remaining parentheses
+    title="${title//(/}"
+    title="${title//)/}"
+
+    [[ -n "$title" ]] || return 1
+    printf '%s%s/Season %02d\n' "$(titlecase "$title")" "${year:+ ($year)}" "$((10#$season))"
+}
+
 # --- convert ---
 converted=0
 failed=0
@@ -223,6 +295,16 @@ convert_file() {
         dst_dir="$output_dir"
     else
         dst_dir="$HOME/PROJECTOR"
+    fi
+
+    # Jellyfin layout: <output>/Show (Year)/Season NN/
+    if [[ "$jellyfin" -eq 1 ]]; then
+        local sub
+        if sub="$(jellyfin_subdir "${src_base%.*}")"; then
+            dst_dir="$dst_dir/$sub"
+        else
+            echo "  Note: no SxxEyy marker, writing to output root (movie)"
+        fi
     fi
 
     mkdir -p "$dst_dir"
