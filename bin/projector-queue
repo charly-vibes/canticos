@@ -19,6 +19,12 @@ done
 readonly QUEUE="${queue_dir:-$HOME/Downloads/MOVIES}"
 readonly DONE="$QUEUE/DONE"
 
+# dry-run passthrough (-n/--dry-run): report targets but keep the queue intact
+dry_run=0
+for arg in "${tp_args[@]}"; do
+    [[ "$arg" == "-n" || "$arg" == "--dry-run" ]] && dry_run=1
+done
+
 mkdir -p "$DONE"
 
 succeeded=0
@@ -56,9 +62,14 @@ for entry in "$QUEUE"/*; do
     args+=("$entry")
 
     if to-projector "${tp_args[@]}" "${args[@]}"; then
-        mv "$entry" "$DONE/"
-        echo "  -> moved to DONE/"
-        ((++succeeded))
+        if [[ "$dry_run" -eq 1 ]]; then
+            echo "  (dry-run: left in place)"
+            ((++skipped))
+        else
+            mv "$entry" "$DONE/"
+            echo "  -> moved to DONE/"
+            ((++succeeded))
+        fi
     else
         echo "  FAILED, leaving in place" >&2
         ((++failed))
