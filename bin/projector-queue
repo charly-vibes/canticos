@@ -4,8 +4,7 @@ set -euo pipefail
 # projector-queue — Process a queue of videos through to-projector into
 # the ~/PROJECTOR library (Movies/ + Shows/).
 #
-# Default queue: ~/Downloads/MOVIES/ (override with an argument, or
-# pass --lib to use the library itself as the queue).
+# Default queue: ~/Downloads/MOVIES/ (override with an argument).
 #
 # Each entry (file or directory) is classified as a show (has SxxEyy /
 # Sxx markers in its name, or in the episode files inside) or a movie,
@@ -22,7 +21,6 @@ queue_dir=""
 tp_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --lib) queue_dir="$HOME/PROJECTOR"; shift ;;
         --) shift; tp_args+=("$@"); break ;;
         *)  queue_dir="$1"; shift ;;
     esac
@@ -45,7 +43,9 @@ for arg in "${tp_args[@]}"; do
     prev="$arg"
 done
 
-mkdir -p "$DONE" "$LIB/Movies" "$LIB/Shows"
+if [[ "$dry_run" -eq 0 ]]; then
+    mkdir -p -- "$DONE" "$LIB/Movies" "$LIB/Shows"
+fi
 
 succeeded=0
 failed=0
@@ -77,7 +77,8 @@ classify() {
                 echo show
                 return
             fi
-        done < <(find "$entry" -maxdepth 2 -type f -print0 | sort -z)
+        done < <(find "$entry" -maxdepth 2 -type f -print0 | sort -z |
+                 grep -zE '\.(mkv|avi|wmv|flv|webm|mov|mp4|ts|m2ts|mpg|mpeg|vob|ogv|3gp)$')
     fi
     echo movie
 }
