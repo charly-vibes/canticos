@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# projector-queue — Process ~/Downloads/MOVIES/ through to-projector
+# projector-queue — Process a queue of videos through to-projector into
+# the ~/PROJECTOR library (Movies/ + Shows/).
 #
-# Converts each entry (file or directory) in MOVIES/ using to-projector,
-# then moves the source to MOVIES/DONE/. Idempotent: already-converted
-# files are skipped by to-projector, and already-moved sources are
-# naturally absent from the queue.
+# Default queue: ~/Downloads/MOVIES/ (override with an argument, or
+# pass --lib to use the library itself as the queue).
+#
+# Each entry (file or directory) is classified as a show (has SxxEyy /
+# Sxx markers in its name, or in the episode files inside) or a movie,
+# and handed to to-projector with the matching library root:
+#
+#   show  -> ~/PROJECTOR/Shows/   (episodes land in Show (Year)/Season NN/)
+#   movie -> ~/PROJECTOR/Movies/  (written flat into Movies/)
+#
+# After a successful conversion the source is moved to QUEUE/DONE/.
+# Idempotent: already-converted files are skipped by to-projector, and
+# already-moved sources are naturally absent from the queue.
 
 queue_dir=""
 tp_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --lib) queue_dir="$HOME/PROJECTOR"; shift ;;
         --) shift; tp_args+=("$@"); break ;;
         *)  queue_dir="$1"; shift ;;
     esac
 done
 readonly QUEUE="${queue_dir:-$HOME/Downloads/MOVIES}"
+readonly LIB="$HOME/PROJECTOR"
 readonly DONE="$QUEUE/DONE"
 
 # dry-run passthrough (-n/--dry-run): report targets but keep the queue intact
@@ -25,11 +37,50 @@ for arg in "${tp_args[@]}"; do
     [[ "$arg" == "-n" || "$arg" == "--dry-run" ]] && dry_run=1
 done
 
-mkdir -p "$DONE"
+# respect an explicit -o/--output if the caller supplied one
+output_given=0
+prev=""
+for arg in "${tp_args[@]}"; do
+    [[ "$prev" == "-o" || "$prev" == "--output" ]] && output_given=1
+    prev="$arg"
+done
+
+mkdir -p "$DONE" "$LIB/Movies" "$LIB/Shows"
 
 succeeded=0
 failed=0
 skipped=0
+
+# does a basename carry an episode/season marker?
+is_show_name() {
+    local base="$1"
+    [[ "$base" =~ [sS][0-9]{1,2}[^0-9a-zA-Z]*[eE][0-9]{1,3}([^0-9a-zA-Z]|$) ]] && return 0
+    [[ "$base" =~ [sS][0-9]{1,2}([^0-9a-zA-Z]|$) ]]
+}
+
+# classify an entry: prints "show" or "movie".
+# Files are judged by their own name; directories by their name first,
+# then by scanning contained files (up to depth 2) for episode markers.
+classify() {
+    local entry="$1" name base f
+    name="$(basename "$entry")"
+    name="${name%.*}"
+    if is_show_name "$name"; then
+        echo show
+        return
+    fi
+    if [[ -d "$entry" ]]; then
+        while IFS= read -r -d '' f; do
+            base="$(basename "$f")"
+            base="${base%.*}"
+            if is_show_name "$base"; then
+                echo show
+                return
+            fi
+        done < <(find "$entry" -maxdepth 2 -type f -print0 | sort -z)
+    fi
+    echo movie
+}
 
 for entry in "$QUEUE"/*; do
     [[ -e "$entry" ]] || continue
@@ -54,11 +105,21 @@ for entry in "$QUEUE"/*; do
         continue
     fi
 
-    echo "=== $name ==="
+    kind="$(classify "$entry")"
+    if [[ "$kind" == "show" ]]; then
+        dest="$LIB/Shows"
+    else
+        dest="$LIB/Movies"
+    fi
+
+    echo "=== $name [$kind] ==="
 
     # directories get -r for recursive processing
     args=()
     [[ -d "$entry" ]] && args+=(-r)
+    if [[ "$output_given" -eq 0 ]]; then
+        args+=(-o "$dest")
+    fi
     args+=("$entry")
 
     if to-projector "${tp_args[@]}" "${args[@]}"; then
