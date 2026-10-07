@@ -279,6 +279,36 @@ jellyfin_subdir() {
     printf '%s%s/Season %02d\n' "$(titlecase "$title")" "${year:+ ($year)}" "$((10#$season))"
 }
 
+# --- fallback for season-folder layouts with bare episode filenames ---
+# e.g. "Midsomer Murders/Season 01/0.mkv": no SxxEyy markers anywhere, but the
+# parent "Season NN" directory and the show directory above it carry the
+# information. Prints "<Show Title>/Season NN<TAB><Show Title SxxEyy>" and
+# returns 0 if derivable, 1 otherwise. Episode number comes from the leading
+# integer of the filename; if the folder contains a 0.* file the numbering is
+# 0-based and the episode is shifted by +1.
+season_dir_subdir() {
+    local src="$1" season_dir dir title season base num shift
+    season_dir="$(dirname "$src")"
+    season="$(basename "$season_dir")"
+    local re='^[Ss]eason[._ ]?([0-9]{1,2})$'
+    [[ "$season" =~ $re ]] || return 1
+    season="${BASH_REMATCH[1]}"
+    dir="$(dirname "$season_dir")"
+    title="$(basename "$dir")"
+    [[ "$title" != "/" && "$title" != "." ]] || return 1
+    base="$(basename "$src")"
+    [[ "$base" =~ ^([0-9]{1,3})\.($VIDEO_EXTS)$ ]] || return 1
+    num="${BASH_REMATCH[1]}"
+    shift=0
+    [[ -n "$(find "$season_dir" -maxdepth 1 -type f -name '0.*')" ]] && shift=1
+    num=$(( (10#$num) + shift ))
+    title="${title//_/ }"
+    title="$(titlecase "$title")"
+    [[ -n "$title" ]] || return 1
+    printf '%s/Season %02d\t%s S%02dE%02d\n' \
+        "$title" "$((10#$season))" "$title" "$((10#$season))" "$num"
+}
+
 # --- convert ---
 converted=0
 failed=0
@@ -299,9 +329,14 @@ convert_file() {
 
     # Jellyfin layout: <output>/Show (Year)/Season NN/
     if [[ "$jellyfin" -eq 1 ]]; then
-        local sub
+        local sub derived
         if sub="$(jellyfin_subdir "${src_base%.*}")"; then
             dst_dir="$dst_dir/$sub"
+        elif derived="$(season_dir_subdir "$src")"; then
+            sub="${derived%%$'\t'*}"
+            dst_base="$(slugify "${derived#*$'\t'}").mkv"
+            dst_dir="$dst_dir/$sub"
+            echo "  Note: derived '$sub' + '$dst_base' from season-folder layout"
         else
             echo "  Note: no SxxEyy marker, writing to output root (movie)"
         fi
