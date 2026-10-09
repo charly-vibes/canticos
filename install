@@ -15,6 +15,7 @@ scripts=(
     llm-dashboard
     claude-dashboard
     ci-usage
+    terapia
 )
 
 for name in "${scripts[@]}"; do
