@@ -17,6 +17,35 @@ def sessions-dir [] {
   $env.TERAPIA_SESSIONS? | default ($nu.home-dir | path join ".pi" "agent" "sessions")
 }
 
+def cache-dir [] {
+  $env.TERAPIA_CACHE? | default ($nu.cache-dir | path join "terapia")
+}
+
+# Cache key: path + mtime + size — any edit to the file changes it.
+def cache-key [path: string] {
+  let st = (ls $path | first)
+  let sig = $"($path)|($st.modified? | format date '%s.%f')|($st.size? | default 0)"
+  $sig | hash md5
+}
+
+# Single-file scan with an mtime-keyed cache: {meta, errors} (errors = classified rows).
+def cached-scan [path: string] {
+  let key = (cache-key $path)
+  let cfile = ((cache-dir) | path join $"($key).json")
+  if ($cfile | path exists) {
+    try { return (open --raw $cfile | from json) } catch { null }
+  }
+  let sc = (scan-file $path)
+  let rows = (error-rows $sc.meta $sc.pairs)
+  mkdir (cache-dir)
+  ({meta: $sc.meta, errors: $rows} | to json | save -f $cfile)
+  {meta: $sc.meta, errors: $rows}
+}
+
+def cached-all [] {
+  session-files | each {|f| cached-scan $f }
+}
+
 def dir-to-project [name: string] {
   $name | str trim --char "-" | str replace --all "--" "/"
 }
@@ -187,12 +216,7 @@ def "main errors" [session_id?: string, --all, --group-by: string] {
     error make {msg: "usage: terapia errors <session-id> | --all"}
   }
   let rows = (if $all {
-    session-files
-    | each {|f|
-        let sc = (scan-file $f)
-        error-rows $sc.meta $sc.pairs
-      }
-    | flatten
+    cached-all | get errors | flatten
   } else {
     let s = (resolve-session $session_id)
     error-rows $s (pair-from-entries (parse-jsonl $s.file))
@@ -209,8 +233,8 @@ def "main stats" [session_id?: string, --all] {
     error make {msg: "usage: terapia stats <session-id> | --all"}
   }
   if $all {
-    let scans = (session-files | each {|f| scan-file $f })
-    let rows = ($scans | get pairs | each {|ps| $ps | where {|p| $p.result.isError? == true}} | flatten | each {|p| {class: (classify-error (result-text $p.result.content?))}})
+    let scans = (cached-all)
+    let rows = ($scans | get errors | flatten)
     {
       sessions: ($scans | length),
       tool_calls: ($scans | get meta | get tool_calls | math sum),

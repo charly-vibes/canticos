@@ -153,6 +153,45 @@ def test_session_prefix_resolution(tmp):
     assert r.returncode != 0 and "not found" in r.stderr.lower()
 
 
+def test_cache_created_and_reused(tmp):
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
+    cache = tmp / "cache"
+    import os
+    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_CACHE=str(cache))
+    r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    first = json.loads(r.stdout)
+    cache_files = list(cache.glob("*.json"))
+    assert cache_files, "cache dir empty after first run"
+    r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    second = json.loads(r.stdout)
+    assert second == first, "cached result differs from fresh scan"
+
+
+def test_cache_invalidated_on_change(tmp):
+    sid = write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
+    cache = tmp / "cache"
+    import os
+    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_CACHE=str(cache))
+    r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
+                       capture_output=True, text=True, env=env)
+    assert json.loads(r.stdout)["errors"] == 2
+    # append a new failing tool result → must invalidate that file's cache entry
+    with open(tmp / "--a--proj--" / f"2026-10-09T10-00-00Z_{sid}.jsonl", "a") as f:
+        f.write(json.dumps({"type": "message", "message": {
+            "role": "toolResult", "toolCallId": "c9", "toolName": "bash",
+            "content": [{"type": "text", "text": "boom, exit code 1"}],
+            "isError": True}}) + "\n")
+    r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
+                       capture_output=True, text=True, env=env)
+    out = json.loads(r.stdout)
+    assert out["errors"] == 3, "stale cache after file change"
+    assert out["by_class"].get("exit_nonzero") == 1
+
+
 def test_no_heredoc_needed_smoke(tmp):
     # the whole point: one command answers what used to take a bespoke script
     sid = write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
