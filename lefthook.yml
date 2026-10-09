@@ -2,6 +2,16 @@ pre-commit:
   commands:
     python:
       run: python3 -m py_compile bin/*.py
+    nu:
+      run: |
+        for f in bin/*; do
+          if head -1 "$f" | grep -q 'env nu'; then
+            out=$(nu --no-config-file -c "nu --ide-check 1 $f")
+            if echo "$out" | grep -q '"severity":"Error"'; then
+              echo "$out"; exit 1
+            fi
+          fi
+        done
     shell:
       run: |
         sh -n install
@@ -15,6 +25,16 @@ pre-push:
   commands:
     python:
       run: python3 -m py_compile bin/*.py
+    nu:
+      run: |
+        for f in bin/*; do
+          if head -1 "$f" | grep -q 'env nu'; then
+            out=$(nu --no-config-file -c "nu --ide-check 1 $f")
+            if echo "$out" | grep -q '"severity":"Error"'; then
+              echo "$out"; exit 1
+            fi
+          fi
+        done
     shell:
       run: |
         sh -n install

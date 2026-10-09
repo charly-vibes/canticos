@@ -17,6 +17,7 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 | `projector-queue` | Procesa la cola `~/Downloads/MOVIES/` a través de `to-projector`; clasifica cada entrada como serie o película y la envía a `~/PROJECTOR/Shows/` o `~/PROJECTOR/Movies/` |
 | `to-projector` | Convierte video a MKV compatible con proyector (H.264 + AAC estéreo); ordena episodios en estructura Jellyfin `Show (Year)/Season NN/` bajo el directorio de salida |
 | `transcribe` | Transcribe audio a texto con whisper-cli |
+| `terapia` | Consulta CLI en nushell sobre `~/.pi/agent/sessions`: sesiones, tool calls y errores clasificados como JSON — la alternativa estable al heredoc-parser de turno |
 
 ## Instalación
 
@@ -31,6 +32,20 @@ Para instalar en otro directorio:
 ```sh
 ./install /otro/path
 ```
+
+### terapia
+
+Salida JSON tipada sobre el corpus de sesiones de Pi; implementa una de las recomendaciones del reporte `../pain/report.org` (contratos de salida estructurados, kill-the-heredoc).
+
+```sh
+terapia list --project areas/dev/gh/charly --since 2026-10-01  # sesiones como JSON
+terapia stats --all --since 2026-10-09                        # conteos + errores por clase
+terapia errors --all --group-by class                         # taxonomía de errores
+terapia tools <session-id> --tool bash --errors-only          # tool calls fallidos
+terapia raw <session-id> --type session                       # JSONL crudo
+```
+
+Tests: `python3 tests/test_terapia.py` (fixture sintético; no requiere el corpus real).
 
 
 ---

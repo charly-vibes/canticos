@@ -1,0 +1,245 @@
+#!/usr/bin/env nu
+# terapia — therapy sessions for your agent's past lives.
+#
+# Stable, typed query CLI over ~/.pi/agent/sessions. One command per answer,
+# so you never write another bespoke heredoc parser over session JSONLs.
+#
+# Commands:
+#   list    [--project P] [--since D] [--until D]   sessions as JSON
+#   tools   <session-id> [--tool T] [--errors-only] tool calls + results
+#   errors  <session-id> | --all [--group-by K]     classified tool errors
+#   stats   <session-id> | --all                    counts + error breakdown
+#   raw     <session-id> [--type T]                 raw JSONL entries
+#
+# Output is JSON on stdout. Errors go to stderr; exit 1 on failure.
+
+def sessions-dir [] {
+  $env.TERAPIA_SESSIONS? | default ($nu.home-dir | path join ".pi" "agent" "sessions")
+}
+
+def dir-to-project [name: string] {
+  $name | str trim --char "-" | str replace --all "--" "/"
+}
+
+def parse-jsonl [path: string] {
+  open --raw $path
+  | lines
+  | each {|l| try { $l | from json } catch { null } }
+  | compact
+}
+
+def session-files [] {
+  let root = (sessions-dir)
+  if not ($root | path exists) { return [] }
+  glob ($root | path join "*")
+  | where {|p| ($p | path type) == "dir"}
+  | sort
+  | each {|d| glob ($d | path join "*.jsonl") | sort }
+  | flatten
+}
+
+def meta-from-entries [entries project path] {
+  let header = ($entries | where {|e| $e.type? == "session"} | first)
+  let msgs = ($entries | where {|e| $e.type? == "message"} | get message)
+  let tool_calls = ($msgs
+    | where {|m| $m.role? == "assistant"}
+    | each {|m| $m.content? | default [] | where {|c| $c.type? == "toolCall"} | length }
+    | reduce -f 0 {|it, acc| $acc + $it })
+  {
+    id: ($header.id?),
+    project: $project,
+    file: $path,
+    timestamp: ($header.timestamp?),
+    cwd: ($header.cwd?),
+    messages: ($msgs | where {|m| $m.role? != "toolResult"} | length),
+    tool_calls: $tool_calls,
+    errors: ($msgs | where {|m| $m.role? == "toolResult" and $m.isError? == true} | length),
+  }
+}
+
+# Cheap: only the first JSONL line (the session header) per file.
+def header-of [path: string] {
+  let h = (^head -n1 $path | from json)
+  {
+    id: ($h.id?),
+    project: (dir-to-project ($path | path dirname | path basename)),
+    file: $path,
+    timestamp: ($h.timestamp?),
+    cwd: ($h.cwd?),
+  }
+}
+
+def sessions-headers [] {
+  session-files | each {|f| header-of $f }
+}
+
+def resolve-session [session_id: string] {
+  let matches = (sessions-headers
+    | where {|s| $s.id? | default "" | str starts-with $session_id })
+  if ($matches | is-empty) {
+    error make {msg: $"session not found: ($session_id)"}
+  }
+  if ($matches | length) > 1 {
+    let ids = ($matches | get id | str join ", ")
+    error make {msg: $"ambiguous prefix ($session_id): ($ids)"}
+  }
+  $matches | first
+}
+
+def result-text [content] {
+  $content | default []
+  | each {|c| if ($c.type? == "text") { $c.text? | default "" } else { "" } }
+  | str join "\n"
+}
+
+def pair-from-entries [entries] {
+  mut pending = {}
+  mut out = []
+  for e in $entries {
+    if ($e.type? != "message") { continue }
+    let m = ($e.message?)
+    if ($m.role? == "assistant") {
+      let calls = ($m.content? | default [] | where {|c| $c.type? == "toolCall"})
+      for c in $calls { $pending = ($pending | upsert $c.id $c) }
+    } else if ($m.role? == "toolResult") {
+      let call = ($pending | get -o $m.toolCallId?)
+      $pending = ($pending | reject -o $m.toolCallId?)
+      $out = ($out | append {call: $call, result: $m, timestamp: ($e.timestamp?)})
+    }
+  }
+  $out
+}
+
+def classify-error [text: string] {
+  let t = ($text | str lowercase)
+  if ($t =~ 'oldtext|old_string|not found in|overlap') { "edit_mismatch" } else if ($t =~ 'no such file|enoent|does not exist|not found:') { "file_not_found" } else if ($t =~ 'unrecognized|invalid flag|unknown flag|no such option|unknown subcommand') { "cli_flag_drift" } else if ($t =~ 'traceback|stacktrace|panic:|syntaxerror|typeerror|nameerror|referenceerror') { "lang_runtime" } else if ($t =~ 'timeout|connection refused|econnrefused|connection reset|enotfound') { "network" } else if ($t =~ 'exit code|exited with code|non-zero exit') { "exit_nonzero" } else { "other" }
+}
+
+def in-window [s since until] {
+  let ts = ($s.timestamp? | default "")
+  if ($since != null and ($ts | str substring 0..9) < $since) { return false }
+  if ($until != null and ($ts | str substring 0..9) > $until) { return false }
+  true
+}
+
+def group-counts [rows key] {
+  $rows
+  | reduce -f {} {|e, acc|
+      let k = ($e | get $key)
+      let v = (($acc | get -o $k) | default 0)
+      $acc | upsert $k ($v + 1)
+    }
+}
+
+# One pass per file: {meta, pairs} — used by --all commands.
+def scan-file [path: string] {
+  let project = (dir-to-project ($path | path dirname | path basename))
+  let entries = (parse-jsonl $path)
+  {
+    meta: (meta-from-entries $entries $project $path),
+    pairs: (pair-from-entries $entries),
+  }
+}
+
+def error-rows [s pairs] {
+  $pairs
+  | where {|p| $p.result.isError? == true}
+  | each {|p| {
+      session: $s.id,
+      project: $s.project,
+      tool: ($p.result.toolName? | default ($p.call?.name?)),
+      class: (classify-error (result-text $p.result.content?)),
+      input: ($p.call?.arguments?),
+      result: (result-text $p.result.content?),
+      timestamp: $p.timestamp,
+    }}
+}
+
+def "main list" [--project: string, --since: string, --until: string] {
+  session-files
+  | each {|f|
+      let project = (dir-to-project ($f | path dirname | path basename))
+      let entries = (parse-jsonl $f)
+      meta-from-entries $entries $project $f
+    }
+  | where {|s| $project == null or $s.project == $project}
+  | where {|s| in-window $s $since $until}
+  | to json
+}
+
+def "main tools" [session_id: string, --tool: string, --errors-only] {
+  let s = (resolve-session $session_id)
+  pair-from-entries (parse-jsonl $s.file)
+  | where {|p| $tool == null or ($p.call?.name? == $tool) or ($p.result.toolName? == $tool)}
+  | where {|p| not $errors_only or ($p.result.isError? == true)}
+  | each {|p| {
+      tool: ($p.call?.name? | default ($p.result.toolName?)),
+      input: ($p.call?.arguments?),
+      isError: ($p.result.isError?),
+      result: (result-text $p.result.content?),
+      timestamp: $p.timestamp,
+    }}
+  | to json
+}
+
+def "main errors" [session_id?: string, --all, --group-by: string] {
+  if ($all == false and $session_id == null) {
+    error make {msg: "usage: terapia errors <session-id> | --all"}
+  }
+  let rows = (if $all {
+    session-files
+    | each {|f|
+        let sc = (scan-file $f)
+        error-rows $sc.meta $sc.pairs
+      }
+    | flatten
+  } else {
+    let s = (resolve-session $session_id)
+    error-rows $s (pair-from-entries (parse-jsonl $s.file))
+  })
+  if $group_by != null {
+    group-counts $rows $group_by | to json
+  } else {
+    $rows | to json
+  }
+}
+
+def "main stats" [session_id?: string, --all] {
+  if ($all == false and $session_id == null) {
+    error make {msg: "usage: terapia stats <session-id> | --all"}
+  }
+  if $all {
+    let scans = (session-files | each {|f| scan-file $f })
+    let rows = ($scans | get pairs | each {|ps| $ps | where {|p| $p.result.isError? == true}} | flatten | each {|p| {class: (classify-error (result-text $p.result.content?))}})
+    {
+      sessions: ($scans | length),
+      tool_calls: ($scans | get meta | get tool_calls | math sum),
+      errors: ($rows | length),
+      by_class: (group-counts $rows "class"),
+    } | to json
+  } else {
+    let s = (resolve-session $session_id)
+    let entries = (parse-jsonl $s.file)
+    let meta = (meta-from-entries $entries $s.project $s.file)
+    let rows = (error-rows $s (pair-from-entries $entries))
+    {
+      session: $s.id,
+      messages: $meta.messages,
+      tool_calls: $meta.tool_calls,
+      errors: ($rows | length),
+      by_class: (group-counts $rows "class"),
+    } | to json
+  }
+}
+
+def "main raw" [session_id: string, --type: string] {
+  let s = (resolve-session $session_id)
+  parse-jsonl $s.file
+  | where {|e| $type == null or $e.type? == $type}
+  | each {|e| $e | to json -r }
+  | str join (char nl)
+}
+
+def main [] {
+  print "usage: terapia <list|tools|errors|stats|raw> ... — see terapia --help"
+}
