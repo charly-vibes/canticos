@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "canticos",
+  "project_id": "8bbc38cc-803a-448e-8d22-282ce286e545"
+}
