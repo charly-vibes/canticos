@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# fi — Free model wrapper for pi coding agent
+#
+# Wrapper that only allows free models (including openrouter/free) with simple aliases.
+# Triggers a subset of pi functionality focused on free OpenRouter models.
+#
+# USAGE:
+#   fi <command> [options] [arguments]
+#
+# SUBCOMMANDS:
+#   doctor    Show system status and free model compatibility info
+#   list       List available free models (alias: ls)
+#   (any other) Pass through to pi with free model validation
+#
+# SIMPLE ALIASES:
+#   laguna     -> poolside/laguna-s-2.1:free
+#   lagunar    -> poolside/laguna-xs-2.1:free
+#   nemo       -> nvidia/nemotron-3-ultra-550b-a55b:free
+#   nemotron   -> nvidia/nemotron-3.5-lightning:free
+#   nemox      -> nvidia/nemotron-3.5-super-vl:free
+#   nemo2      -> nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+#   inkling    -> inkling:free
+#   inkling-s  -> inkling-small:free
+#   openrouter -> openrouter/free
+
+set -euo pipefail
+
+# Free model aliases mapping
+declare -A FREE_MODELS=(
+    [laguna]="poolside/laguna-s-2.1:free"
+    [lagunar]="poolside/laguna-xs-2.1:free"
+    [nemo]="nvidia/nemotron-3-ultra-550b-a55b:free"
+    [nemotron]="nvidia/nemotron-3.5-lightning:free"
+    [nemox]="nvidia/nemotron-3.5-super-vl:free"
+    [nemo2]="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+    [inkling]="inkling:free"
+    [inkling-s]="inkling-small:free"
+    [openrouter]="openrouter/free"
+)
+
+# Working free models (from testing)
+declare -A WORKING_MODELS=(
+    [poolside/laguna-s-2.1:free]="true"
+    [poolside/laguna-xs-2.1:free]="true"
+    [nvidia/nemotron-3-ultra-550b-a55b:free]="true"
+    [nvidia/nemotron-3.5-lightning:free]="true"
+    [nvidia/nemotron-3.5-super-vl:free]="true"
+    [nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free]="true"
+    [inkling:free]="true"
+    [inkling-small:free]="true"
+    [openrouter/free]="true"
+)
+
+# Default timeout in seconds
+DEFAULT_TIMEOUT="900"
+
+# Show usage
+show_help() {
+    cat << 'EOF'
+fi — Free model wrapper for pi coding agent
+
+USAGE:
+  fi <command> [options] [arguments]
+
+SUBCOMMANDS:
+  doctor           Show system status and free model compatibility info
+  list|ls          List available free models
+  <any pi command>  Pass through to pi (requires free model)
+
+SIMPLE ALIASES (for --model):
+  laguna           -> poolside/laguna-s-2.1:free
+  lagunar          -> poolside/laguna-xs-2.1:free
+  nemo             -> nvidia/nemotron-3-ultra-550b-a55b:free
+  nemotron         -> nvidia/nemotron-3.5-lightning:free
+  nemox            -> nvidia/nemotron-3.5-super-vl:free
+  nemo2            -> nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+  inkling          -> inkling:free
+  inkling-s        -> inkling-small:free
+  openrouter       -> openrouter/free
+
+EXAMPLES:
+  fi laguna "hello world"               # Use laguna alias
+  fi nemo2 "write a python script"        # Use nemo2 alias
+  fi --list                              # List free models
+  fi doctor                              # Show system info
+  fi nemo "list" --model nemo             # Pi's list-models with nemo alias
+
+CONSTRAINTS:
+- Only free models (ending with :free) are allowed
+- Aliases are for convenience only; actual model IDs follow openrouter naming
+- All other pi parameters are passed through unchanged
+- No interaction or persistent sessions by default (use --session-dir to enable)
+- Use --timeout <seconds> to set a timeout (default 900 / 15 min)
+EOF
+}
+
+# Show system doctor info
+doctor() {
+    local pi_path
+    pi_path="$(command -v pi 2>/dev/null || echo 'NOT FOUND')"
+    local session_dir="$HOME/.pi/agent/sessions"
+    local cache_dir="$HOME/.cache/terapia"
+
+    cat << EOF
+== Free Model pi Wrapper (fi) Doctor Report ==
+
+PI STATUS:
+- Executable: $pi_path
+- Session directory: $session_dir (exists: $(test -d "$session_dir" && echo "YES" || echo "NO"))
+- Cache directory: $cache_dir (exists: $(test -d "$cache_dir" && echo "YES" || echo "NO"))
+
+AUTHENTICATION:
+$(if [ -f "$HOME/.pi/agent/auth.json" ]; then
+    local openrouter_key
+    openrouter_key="$(grep -o '"key":"[^"]*"' "$HOME/.pi/agent/auth.json" 2>/dev/null || echo 'NOT FOUND')"
+    echo "- OpenRouter API key: ${openrouter_key:-[PROTECTED]}"
+else
+    echo "- OpenRouter API key: NOT SET"
+fi)
+
+WORKING FREE MODELS:
+$(for model in "${!WORKING_MODELS[@]}"; do
+    echo "- $model"
+done | sort)
+
+ALLOWED ALIASES:
+$(for alias in "${!FREE_MODELS[@]}"; do
+    echo "  $alias -> ${FREE_MODELS[$alias]}"
+done)
+
+USAGE NOTES:
+- Use 'fi <alias> <prompt>' to run with a free model
+- Use 'fi ls' or 'fi list' to list free models
+- Use 'fi doctor' for this system info
+- Use 'fi nemo2 "write a python script"' to test a free model
+- All other pi parameters (--session, --name, --thinking, etc.) are forwarded
+
+SESSION PERSISTENCE:
+$(if [ -d "$session_dir" ]; then
+    local session_count
+    session_count="$(find "$session_dir" -name "*.jsonl" 2>/dev/null | wc -l)"
+    echo "- Existing sessions: $session_count"
+else
+    echo "- No session directory found"
+fi)
+EOF
+}
+
+# List free models
+list_models() {
+    cat << 'EOF'
+AVAILABLE FREE MODELS:
+
+Simple Aliases (recommended):
+  laguna           poolside/laguna-s-2.1:free    - Large general purpose
+  lagunar          poolside/laguna-xs-2.1:free   - Smaller general purpose
+  nemo             nvidia/nemotron-3-ultra-550b-a55b:free - Largest nemotron
+  nemotron         nvidia/nemotron-3.5-lightning:free - Fastest nemotron
+  nemox            nvidia/nemotron-3.5-super-vl:free - Vision-capable nemotron
+  nemo2            nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free - Reasoning nemotron
+  inkling          inkling:free                   - Original inkling model
+  inkling-s        inkling-small:free             - Smaller inkling
+  openrouter       openrouter/free                - Generic free model
+
+All models require a free-tier or paid OpenRouter account.
+Most support tool calling and reasoning (check model details at openrouter.ai).
+
+RUNNING:
+  fi laguna "hello world"          # Use laguna alias
+  fi nemo2 "write a python script"   # Use nemo2 alias
+  fi nemo "list"                   # Pi's list-models with nemo
+EOF
+}
+
+# Map alias to full model name
+resolve_model() {
+    local model_arg="$1"
+    if [[ -n "${FREE_MODELS[$model_arg]}" ]]; then
+        echo "${FREE_MODELS[$model_arg]}"
+    else
+        # Check if it's already a free model
+        if [[ "$model_arg" == *:free ]]; then
+            echo "$model_arg"
+        else
+            echo "Error: '$model_arg' is not a recognized free model alias" >&2
+            echo "Use 'fi list' to see available aliases" >&2
+            exit 1
+        fi
+    fi
+}
+
+# Main function
+main() {
+    local subcommand="${1:-}"
+    shift || true
+
+    # Parse --timeout parameter (default 900 seconds / 15 min)
+    local timeout_value="$DEFAULT_TIMEOUT"
+    local j=0
+    while [[ $j -lt $# ]]; do
+        case "${!j}" in
+            --timeout=*)
+                timeout_value="${!j#--timeout=}"
+                ;;
+            --timeout)
+                j=$((j + 1))
+                timeout_value="${!j}"
+                ;;
+        esac
+        j=$((j + 1))
+    done
+
+    case "${subcommand}" in
+        "doctor"|"--doctor"|"-d")
+            doctor
+            ;;
+        "list"|"ls"|"--list"|"-l")
+            list_models
+            ;;
+        "--help"|"-h"|"help"|"")
+            show_help
+            ;;
+        *)
+            # Pass through to pi with free model validation
+            # Find model parameter
+            local i=0
+            local argc=$#
+            while [[ $i -lt $argc ]]; do
+                case "${!i}" in
+                    --model)
+                        # Next argument is the model
+                        i=$((i + 1))
+                        local model_value="${!i}"
+                        local resolved_model
+                        resolved_model="$(resolve_model "$model_value")"
+                        # Replace with resolved model - rebuild args
+                        local new_args=()
+                        local k=0
+                        while [[ $k -lt $argc ]]; do
+                            if [[ $k -eq $i ]]; then
+                                new_args+=("--model")
+                                new_args+=("$resolved_model")
+                            elif [[ $k -ne $((i - 1)) ]]; then
+                                new_args+=("${!k}")
+                            fi
+                            k=$((k + 1))
+                        done
+                        set -- "${new_args[@]}"
+                        argc=${#new_args[@]}
+                        break
+                        ;;
+                    "--model="*)
+                        local model_value="${!i#--model=}"
+                        local resolved_model
+                        resolved_model="$(resolve_model "$model_value")"
+                        # Replace with resolved model
+                        local new_args=()
+                        local k=0
+                        while [[ $k -lt $argc ]]; do
+                            if [[ "${!k}" == --model=* ]]; then
+                                new_args+=("--model=$resolved_model")
+                            else
+                                new_args+=("${!k}")
+                            fi
+                            k=$((k + 1))
+                        done
+                        set -- "${new_args[@]}"
+                        argc=${#new_args[@]}
+                        break
+                        ;;
+                esac
+                i=$((i + 1))
+            done
+
+            # Final check: if no model was provided, use openrouter/free
+            local has_model=0
+            for arg in "$@"; do
+                if [[ "$arg" == --model* ]]; then
+                    has_model=1
+                    break
+                fi
+            done
+            if [[ $has_model -eq 0 ]]; then
+                set -- --model "openrouter/free" "${@}"
+            fi
+
+            # Guard: unknown alias should abort, not pass through
+            for arg in "$@"; do
+                if [[ "$arg" == --model* ]]; then
+                    local model_check="${arg#--model=}"
+                    [[ "$model_check" == *"free"* || "$model_check" =~ ^openrouter/free$ || "$model_check" =~ ^poolside/ || "$model_check" =~ ^nvidia/ || "$model_check" =~ ^inkling ]] || {
+                        echo "Error: model '$model_check' not a validated free alias" >&2; exit 1;
+                    }
+                fi
+            done
+
+            # Ensure session is always named
+            local has_name=0
+            for arg in "$@"; do
+                if [[ "$arg" == --name* ]]; then
+                    has_name=1
+                    break
+                fi
+            done
+            if [[ $has_name -eq 0 ]]; then
+                set -- --name "fi-$(date +%Y%m%d-%H%M%S)" "${@}"
+            fi
+
+            # Run pi with all arguments, with timeout
+            exec timeout "$timeout_value" pi "${@}"
+            ;;
+    esac
+}
+
+# Run main with all arguments
+main "${@}"

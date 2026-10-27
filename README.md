@@ -18,6 +18,7 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 | `to-projector` | Convierte video a MKV compatible con proyector (H.264 + AAC estéreo); ordena episodios en estructura Jellyfin `Show (Year)/Season NN/` bajo el directorio de salida |
 | `transcribe` | Transcribe audio a texto con whisper-cli |
 | `terapia` | Consulta CLI en nushell sobre `~/.pi/agent/sessions`: sesiones, tool calls y errores clasificados como JSON — la alternativa estable al heredoc-parser de turno |
+| `fi` | Wrapper de modelos libres (`:free`) para `pi`; alias simples (`laguna`, `nemo2`, `openrouter`) y paso directo; `doctor` / `list` / `--timeout` |
 
 ## Instalación
 

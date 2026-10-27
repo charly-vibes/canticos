@@ -12,3 +12,22 @@
   - NU: format date '%s.%f' gives nanosecond-ish mtime; ls|first gives size+modified; hash md5 builtin.
   - Symlink was already live (aaf7353). Global AGENTS.md updated: Personal CLI tools section + ~/.config/agents/canticos.md (full reference: commands, cache, tests, nu gotchas). Repo-local .whisper/ committed per fleet convention.
   - Commits: 5f62bc6 (cache), whisper bank commit. charly hub local-only.
+## Session snapshot - 2026-10-27
+
+### What was worked on
+- Investigated pi parameters controlling context, permissions, and constraints in sessions
+- Created and installed `fi` wrapper script in canticos/bin/fi with 9 free model aliases
+- Added `--timeout` parameter (default 900s / 15 min) using `timeout` command
+- Auto-named sessions via `--name fi-YYYYMMDD-HHMMSS` if not provided
+- Updated `.pi/agent/settings.json`: defaultModel → openrouter/free, httpIdleTimeoutMs → 900000 (15 min)
+
+### Key decisions
+- Only 9 of 11 tested free model aliases work; nvidia/nemotron-3-super-120b-a12b and nvidia/nemotron-3.5-content-safety:free fail routing
+- `openrouter/free` is the validated default; `poolside/laguna-s-2.1:free` most reliable for coding tasks
+- All pi CLI parameters forwarded; wrapper validates only `:free` suffixed models
+
+### Next logical continuation
+- Test remaining pi features with free models (--thinking levels, tool usage patterns)
+- Expand `fi` with model validation/guardrails
+- Document all aliases in README; add --model forwarding tests
+- Ro5 Universal Review (2026-10-27): bin/fi review completed. VERDICT: NEEDS_REVISION (tests + docs missing). Fixed: CORR-001 guard, TESTS (tests/test_fi.py 4 PASS), CLAR-002 (README.md).
