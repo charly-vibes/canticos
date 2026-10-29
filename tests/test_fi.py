@@ -19,6 +19,7 @@ MODELS = [
     "thinkingmachines/inkling:free",
     "poolside/laguna-xs-2.1:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
+    "recursive/flint-v1.0:free",
 ]
 
 
@@ -63,7 +64,8 @@ def test_exact_models(backend, model, syntax):
 
 
 @pytest.mark.parametrize('selector,model', [('inkling', MODELS[1]),
-    ('inkling-s', 'thinkingmachines/inkling-small:free'), ('run', MODELS[0]),
+    ('inkling-s', 'thinkingmachines/inkling-small:free'), ('flint', 'recursive/flint-v1.0:free'),
+    ('run', MODELS[0]),
     ('openrouter', MODELS[0])])
 def test_alias_and_default(backend, selector, model):
     assert run(backend, selector, 'hello').returncode == 0

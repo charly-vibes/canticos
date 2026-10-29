@@ -24,6 +24,7 @@
 #   nemo2      -> nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
 #   inkling    -> thinkingmachines/inkling:free
 #   inkling-s  -> thinkingmachines/inkling-small:free
+#   flint      -> recursive/flint-v1.0:free
 #   openrouter -> openrouter/free
 
 set -euo pipefail
@@ -38,6 +39,7 @@ declare -A FREE_MODELS=(
     [nemo2]="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
     [inkling]="thinkingmachines/inkling:free"
     [inkling-s]="thinkingmachines/inkling-small:free"
+    [flint]="recursive/flint-v1.0:free"
     [openrouter]="openrouter/free"
 )
 
@@ -51,6 +53,7 @@ declare -A WORKING_MODELS=(
     [nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free]="true"
     [thinkingmachines/inkling:free]="true"
     [thinkingmachines/inkling-small:free]="true"
+    [recursive/flint-v1.0:free]="true"
     [openrouter/free]="true"
 )
 
@@ -80,6 +83,7 @@ SIMPLE ALIASES (for --model):
   nemo2            -> nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
   inkling          -> thinkingmachines/inkling:free
   inkling-s        -> thinkingmachines/inkling-small:free
+  flint            -> recursive/flint-v1.0:free
   openrouter       -> openrouter/free
 
 EXAMPLES:
@@ -164,6 +168,7 @@ Simple Aliases (recommended):
   nemo2            nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free - Reasoning nemotron
   inkling          thinkingmachines/inkling:free          - Original inkling model
   inkling-s        thinkingmachines/inkling-small:free    - Smaller inkling
+  flint            recursive/flint-v1.0:free              - Recursive's open-weight coding model
   openrouter       openrouter/free                - Generic free model
 
 All models require a free-tier or paid OpenRouter account.
