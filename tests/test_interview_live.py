@@ -201,6 +201,88 @@ def test_session_name_rejects_path_traversal(env):
         assert not (root / bad).exists()
 
 
+def make_session(root, name, *, start_ts=None, end_ts=None, duration=None,
+                 wav_bytes=None, transcript_lines=0, questions=0):
+    """Fabricate a session dir with the artifacts --list summarizes."""
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    events = []
+    if start_ts is not None:
+        events.append({"ts": start_ts, "seq": 1, "type": "session_start",
+                       "session": name, "mode": "live"})
+    if end_ts is not None:
+        events.append({"ts": end_ts, "seq": 2, "type": "session_end",
+                       "duration": duration if duration is not None else 0.0})
+    if events:
+        (d / "events.jsonl").write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    if wav_bytes:
+        (d / "capture.wav").write_bytes(b"\0" * wav_bytes)
+    if transcript_lines:
+        (d / "transcript.txt").write_text(
+            "\n".join(f"[00:{i:02d}:00] (speaker 0) linea" for i in range(transcript_lines)) + "\n")
+    if questions:
+        (d / "queue.json").write_text(json.dumps(
+            {"questions": [{"text": f"q{i}", "priority": "medium"} for i in range(questions)],
+             "topics": []}, ensure_ascii=False))
+    return d
+
+
+def test_list_sessions_newest_first(env):
+    """canticos-cnb: --list shows sessions newest-first with artifact summary."""
+    root = Path(env["INTERVIEW_DIR"])
+    make_session(root, "interview-20260101-090000", start_ts=1767248400.0,
+                 end_ts=1767252000.0, duration=3600.0, wav_bytes=1024,
+                 transcript_lines=12, questions=4)
+    make_session(root, "interview-20260102-100000", start_ts=1767338400.0)
+    r = run(env, "--list")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert out.index("20260102") < out.index("20260101")  # newest first
+    assert "12 lines" in out
+    assert "4 questions" in out
+    assert "1.0 KB" in out
+    assert "no recording" in out
+
+
+def test_list_json(env):
+    """canticos-cnb: --list --json is machine-readable."""
+    root = Path(env["INTERVIEW_DIR"])
+    make_session(root, "interview-20260101-090000", start_ts=1767248400.0,
+                 end_ts=1767252000.0, duration=3600.0, wav_bytes=2048,
+                 transcript_lines=3, questions=2)
+    r = run(env, "--list", "--json")
+    assert r.returncode == 0, r.stderr
+    data = json.loads(r.stdout)
+    assert len(data["sessions"]) == 1
+    s = data["sessions"][0]
+    assert s["name"] == "interview-20260101-090000"
+    assert s["duration_s"] == 3600.0
+    assert s["transcript_lines"] == 3
+    assert s["questions"] == 2
+    assert s["recording_bytes"] == 2048
+    r2 = run(env, "--json")
+    assert r2.returncode == 2 and "--list" in r2.stderr
+
+
+def test_list_empty_root(env):
+    """canticos-cnb: empty/missing root is a friendly no-op, exit 0."""
+    r = run(env, "--list")
+    assert r.returncode == 0, r.stderr
+    assert "no sessions" in r.stdout.lower()
+
+
+def test_list_flags_legacy_flat_root(env):
+    """canticos-cnb: artifacts directly in the root (pre-session layout) are
+    flagged so the user knows --adopt can move them into a session."""
+    root = Path(env["INTERVIEW_DIR"])
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "capture.wav").write_bytes(b"\0" * 512)
+    (root / "transcript.txt").write_text("[00:01:00] (speaker 0) hola\n")
+    r = run(env, "--list")
+    assert r.returncode == 0, r.stderr
+    assert "--adopt" in r.stdout
+
+
 def test_default_language_is_spanish(env):
     """Interviews are Spanish; per-window 'auto' misdetects on short clips,
     so es is the default and --language auto must be requested explicitly."""

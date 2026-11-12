@@ -382,6 +382,10 @@ def parse_args(argv):
                    help="Whisper language code or 'auto' (default: es — per-window auto misdetects on short clips)")
     p.add_argument("--session", metavar="NAME",
                    help="Session directory name under --out (default: interview-YYYYMMDD-HHMMSS). Reusing a name appends to that session.")
+    p.add_argument("--list", action="store_true",
+                   help="List sessions under --out newest-first (name, date, duration, recording, transcript lines, questions) and exit")
+    p.add_argument("--json", action="store_true",
+                   help="With --list: machine-readable JSON output")
     p.add_argument("--out", metavar="DIR", help="Sessions ROOT dir — each run works in <out>/<session>/ (default: $INTERVIEW_DIR or ~/Interviews)")
     args = p.parse_args(argv)
     if args.from_file and args.rounds:
@@ -394,11 +398,114 @@ def parse_args(argv):
                                      or ".." in args.session
                                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+-]*", args.session)):
         p.error("--session must be a filesystem-safe name (no slashes, no '..')")
+    if args.json and not args.list:
+        p.error("--json requires --list")
     return args
+
+
+SESSION_ARTIFACTS = ("events.jsonl", "transcript.txt", "capture.wav",
+                     "questions.md", "queue.json", "speakers.json")
+
+
+def sessions_root(args):
+    """Resolve the sessions ROOT without constructing a run."""
+    return Path(args.out or os.environ.get("INTERVIEW_DIR") or str(Path.home() / "Interviews"))
+
+
+def find_sessions(root):
+    """Session dirs under root = subdirs holding at least one known artifact."""
+    if not root.is_dir():
+        return []
+    return [d for d in sorted(root.iterdir()) if d.is_dir()
+            and any((d / a).exists() for a in SESSION_ARTIFACTS)]
+
+
+def session_summary(d):
+    """Dir -> summary dict read from artifacts (events first, tolerant of gaps)."""
+    start_ts = end_ts = duration = None
+    events = d / "events.jsonl"
+    if events.exists():
+        for line in events.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") == "session_start":
+                start_ts = rec.get("ts")
+            elif rec.get("type") == "session_end":
+                end_ts = rec.get("ts")
+                duration = rec.get("duration")
+    transcript_lines = 0
+    tp = d / "transcript.txt"
+    if tp.exists():
+        transcript_lines = sum(1 for l in tp.read_text().splitlines() if l.strip())
+    questions = 0
+    qp = d / "queue.json"
+    if qp.exists():
+        try:
+            questions = len(json.loads(qp.read_text()).get("questions") or [])
+        except (json.JSONDecodeError, OSError):
+            questions = 0
+    wav = d / "capture.wav"
+    recording_bytes = wav.stat().st_size if wav.exists() else None
+    return {"name": d.name, "start_ts": start_ts, "end_ts": end_ts,
+            "duration_s": duration, "transcript_lines": transcript_lines,
+            "questions": questions, "recording_bytes": recording_bytes}
+
+
+def fmt_duration(sec):
+    h, rem = divmod(int(sec), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def fmt_bytes(n):
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KB", "MB", "GB"):
+        n /= 1024.0
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} GB"
+
+
+def cmd_list(root, as_json):
+    """--list: print session summaries newest-first (or JSON). Exit 0 always
+    when the root is readable — an empty history is not an error."""
+    summaries = [session_summary(d) for d in find_sessions(root)]
+    summaries.sort(key=lambda s: s["start_ts"]
+                   if s["start_ts"] is not None
+                   else (root / s["name"]).stat().st_mtime,
+                   reverse=True)
+    if as_json:
+        sys.stdout.write(json.dumps({"sessions": summaries}, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    legacy_flat = any((root / a).exists() for a in SESSION_ARTIFACTS)
+    if not summaries:
+        sys.stdout.write(f"interview-live: no sessions in {root}\n")
+        if legacy_flat:
+            sys.stdout.write("Note: legacy flat artifacts in the root —"
+                             " run `interview-live --adopt` to move them into a session.\n")
+        return 0
+    sys.stdout.write(f"Sessions in {root} (newest first):\n")
+    for s in summaries:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["start_ts"])) \
+            if s["start_ts"] else "?"
+        dur = f"{fmt_duration(s['duration_s'])} min" if s["duration_s"] else "—"
+        rec = (f"{fmt_bytes(s['recording_bytes'])} recording"
+               if s["recording_bytes"] is not None else "no recording")
+        sys.stdout.write(f"  {s['name']}  {when}  {dur}  {rec}"
+                         f"  {s['transcript_lines']} lines  {s['questions']} questions\n")
+    if legacy_flat:
+        sys.stdout.write("\nNote: legacy flat artifacts in the root —"
+                         " run `interview-live --adopt` to move them into a session.\n")
+    return 0
 
 
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.list:
+        raise SystemExit(cmd_list(sessions_root(args), args.json))
     tool = InterviewLive(args)
     # choose the dashboard: explicit flag wins; otherwise auto when stdout is a
     # real terminal and curses is available (pipes/scripts stay plain)
