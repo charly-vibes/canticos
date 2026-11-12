@@ -39,6 +39,22 @@ Output ONLY a JSON object (no preamble, no markdown fences) with exactly two key
 - "questions": array of 2-4 strings — the follow-up questions, in the conversation's language
 - "topics": array of objects {"name": str, "priority": "high"|"medium"|"low", "note": str}
   — important topics/signals heard in the NEW lines; keep names short (a few words)
+
+HARD RULES FOR QUESTION QUALITY — a question that breaks these must be rewritten or dropped:
+1. Every question anchors on the guest's OWN exact words or a timestamped moment: quote
+   the phrase inside the question ("when you said 'we paid a fine' — how much was it?")
+   or name the moment ([01:12] the regulator story). No quote anchor, no question.
+2. Reusability test: if a question could be pasted into any other interview of this kind
+   unchanged, it is worthless — delete it. Questions must be un-interchangeable.
+3. Banned shapes (never, unless tied to a specific unexplained detail the guest just
+   said): "tell me more about X", "what do you think about X?", "how was the experience?",
+   "what would you like to see?", and step-by-step walk-ins that don't name what actually
+   happened ("¿Qué pasó exactamente, paso a paso?" with no referenced event is generic).
+4. Prefer what is falsifiable and concrete: numbers (what did it cost?), names and roles
+   (who exactly was there?), dates (which day, when was the last time?), sequence (what
+   happened right before, right after?).
+5. If the guest was vague, abstract, or hypothetical, do not follow into abstraction:
+   pull the last specific instance instead ("when did that last happen to you, in person?").
 """
 
 

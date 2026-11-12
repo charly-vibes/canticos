@@ -13,6 +13,7 @@ Rationale: canticos-c02 — the reactive TUI needs a small, unit-testable model
 
 import json
 import re
+import threading
 import time
 
 PRIORITY_BASE = {"high": 100, "medium": 60, "low": 30}
@@ -86,13 +87,20 @@ def parse_suggestion_output(text):
 
 
 class Queue:
-    """Prioritized suggestion queue shared by the worker loop and the TUI."""
+    """Prioritized suggestion queue shared by the worker loop, the suggestion
+    thread, and the TUI. RLock-guarded: ingest happens off-thread while the
+    dashboard iterates ranked views."""
 
     def __init__(self):
         self.topics = {}     # normalized key -> topic dict
         self.questions = {}  # normalized key -> question dict
+        self._lock = threading.RLock()
 
     def ingest(self, questions=None, topics=None, now=None):
+        with self._lock:
+            self._ingest(questions, topics, now)
+
+    def _ingest(self, questions=None, topics=None, now=None):
         now = now if now is not None else time.time()
         for q in questions or []:
             text = (q.get("text") if isinstance(q, dict) else str(q)).strip()
@@ -135,13 +143,15 @@ class Queue:
             cur["score"] = score_for(cur["priority"], cur["mentions"])
 
     def ranked_topics(self):
-        return sorted(self.topics.values(),
-                      key=lambda t: (-t["score"], -t["last_seen"], t["name"]))
+        with self._lock:
+            return sorted(self.topics.values(),
+                          key=lambda t: (-t["score"], -t["last_seen"], t["name"]))
 
     def ranked_questions(self):
-        return sorted(self.questions.values(),
-                      key=lambda q: (0 if q["status"] == "pending" else 1,
-                                     -q["score"], -q["last_seen"], q["text"]))
+        with self._lock:
+            return sorted(self.questions.values(),
+                          key=lambda q: (0 if q["status"] == "pending" else 1,
+                                         -q["score"], -q["last_seen"], q["text"]))
 
     def top_pending_question(self):
         for q in self.ranked_questions():
@@ -150,9 +160,10 @@ class Queue:
         return None
 
     def mark_asked(self, key):
-        q = self.questions.get(key)
-        if q:
-            q["status"] = "asked"
+        with self._lock:
+            q = self.questions.get(key)
+            if q:
+                q["status"] = "asked"
 
     def snapshot(self, participants=None, updated_at=None):
         """Serializable state, written to queue.json for archival/debug."""

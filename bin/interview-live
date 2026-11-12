@@ -19,6 +19,7 @@
 import argparse
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -48,6 +49,8 @@ class InterviewLive:
         self.whisper = args.whisper_model or os.environ.get("WHISPER_MODEL") or str(Path.home() / "models" / "ggml-base.bin")
         self.ffmpeg_proc = None
         self._ffmpeg_err_fh = None
+        self._suggest_q = queue.Queue()
+        self._suggest_thread = None
         self.interrupted = False
         self.participants = args.participants
         self.queue = core.Queue()
@@ -93,6 +96,36 @@ class InterviewLive:
             self.ui.capture = "stopped"
 
     # -- suggestions -----------------------------------------------------------
+    def _start_suggester(self):
+        """Background thread running pi batches so the transcription loop never
+        blocks on suggestions (the TUI transcript froze for 8-20s per batch)."""
+        def loop():
+            while True:
+                item = self._suggest_q.get()
+                if item is None:
+                    break
+                lines, first = item
+                try:
+                    self.suggest(lines, first)
+                except Exception as e:  # noqa: BLE001 — one bad batch must not kill suggestions
+                    try:
+                        self.log.emit("suggest_error", reason=f"thread:{type(e).__name__}:{e}")
+                    except Exception:  # noqa: BLE001 — log may be closing at shutdown
+                        pass
+        self._suggest_thread = threading.Thread(target=loop, daemon=True)
+        self._suggest_thread.start()
+
+    def _stop_suggester(self, timeout=200.0):
+        """Flush queued batches (sentinel is last-in-line) within timeout; on
+        timeout the daemon thread is abandoned so shutdown stays responsive."""
+        if self._suggest_thread:
+            self._suggest_q.put(None)
+            self._suggest_thread.join(timeout)
+            self._suggest_thread = None
+
+    def _enqueue_suggestions(self, lines, first):
+        self._suggest_q.put((lines, first))
+
     def suggest(self, new_lines, first):
         cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
                                self.participants, self.ui, "\n".join(new_lines))
@@ -163,6 +196,7 @@ class InterviewLive:
                       participants=self.participants,
                       pi_model=self.args.pi_model, out=str(self.out))
         try:
+            self._start_suggester()
             self.start_capture()
             if self.args.from_file:
                 # replay: wait for the conversion to finish before transcribing
@@ -186,6 +220,7 @@ class InterviewLive:
                 sys.stdout.write("interview-live: no transcript captured\n")
         finally:
             self.stop_capture()
+            self._stop_suggester(timeout=10.0 if self.interrupted else 200.0)
             self.log.emit("session_end", reason="interrupted" if self.interrupted else "replay" if self.args.from_file else "quit",
                           duration=round(time.time() - self.started_at, 1),
                           transcript_lines=len(self.ui.transcript) if self.ui else 0,
@@ -235,7 +270,7 @@ class InterviewLive:
                     sys.stdout.write("\n".join(lines) + "\n")
                 pending.extend(lines)
                 if len(pending) >= self.args.min_segments:
-                    self.suggest(pending, first)
+                    self._enqueue_suggestions(pending, first)
                     pending = []
                     first = False
             if self.args.from_file:
@@ -280,7 +315,7 @@ def parse_args(argv):
     p.add_argument("--from", dest="from_file", metavar="FILE",
                    help="Replay an existing recording instead of live capture (expects L=interviewer, R=guest stereo or mic-track/system-track).")
     p.add_argument("--rounds", type=int, default=0, help="Transcription rounds before exit (default: infinite until Ctrl+C)")
-    p.add_argument("--every", type=float, default=10.0, help="Seconds between transcription passes (default: 10)")
+    p.add_argument("--every", type=float, default=5.0, help="Seconds between transcription passes (default: 5; lower = fresher transcript, more whisper calls)")
     p.add_argument("--min-segments", type=int, default=1, help="New segment lines that trigger a suggestion batch (default: 1)")
     p.add_argument("--participants", type=int, default=2,
                    help="Number of participants in the conversation (default: 2; drives the TUI roster and the pi system prompt)")

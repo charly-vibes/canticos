@@ -41,6 +41,9 @@ if os.environ.get('FFMPEG_LIVE'):
 WHISPER_FAKE = """#!/usr/bin/env python3
 import json, os, sys
 from pathlib import Path
+if 'ORDER_LOG' in os.environ:
+    with open(os.environ['ORDER_LOG'], 'a') as fh:
+        fh.write('W\\n')
 with open(os.environ['WHISPER_LOG'], 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
 args = sys.argv
@@ -68,8 +71,11 @@ else:
 """
 
 PI_FAKE = """#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 from pathlib import Path
+if 'ORDER_LOG' in os.environ:
+    with open(os.environ['ORDER_LOG'], 'a') as fh:
+        fh.write('P-start\\n')
 with open(os.environ['PI_LOG'], 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
 if os.environ.get('PI_FAIL'):
@@ -89,6 +95,11 @@ if os.environ.get('PI_MODE') == 'json':
 else:
     print("Q1: Tell me more about the supplier problem and its cost.")
     print("Q2: What did you do differently the following month?")
+if 'ORDER_LOG' in os.environ:
+    if os.environ.get('PI_SLEEP'):
+        time.sleep(float(os.environ['PI_SLEEP']))
+    with open(os.environ['ORDER_LOG'], 'a') as fh:
+        fh.write('P-end\\n')
 """
 
 
@@ -108,6 +119,7 @@ def env(tmp_path):
                 FFMPEG_LOG=str(log / "ffmpeg.jsonl"),
                 WHISPER_LOG=str(log / "whisper.jsonl"),
                 PI_LOG=str(log / "pi.jsonl"),
+                ORDER_LOG=str(log / "order.txt"),
                 INTERVIEW_MIC="test-mic", INTERVIEW_MONITOR="test-sink.monitor")
 
 
@@ -173,6 +185,27 @@ def test_live_capture_overwrites_stale_file(env):
     # ffmpeg stderr is captured to the interview dir for post-mortems
     errlog = out / "ffmpeg.log"
     assert errlog.exists() and "diagnostic line" in errlog.read_text()
+
+
+def test_transcription_continues_while_pi_thinks(env):
+    """Regression: the pi suggestion call ran inline in the worker loop and
+    froze transcript updates for its whole duration; suggestions must run
+    asynchronously so live transcription never waits on pi, and pending
+    batches are flushed (joined) before exit."""
+    env_ = {**env, "PI_SLEEP": "2"}
+    r = run(env_, "--rounds", "4", "--every", "0.5", "--min-segments", "1", live=True)
+    assert r.returncode == 0, r.stderr
+    order = Path(env_["ORDER_LOG"]).read_text().split()
+    w_idx = [i for i, x in enumerate(order) if x == "W"]
+    assert len(w_idx) == 4, order
+    assert "P-start" in order and "P-end" in order, order
+    # rounds kept transcribing while the first pi batch was still thinking
+    p0 = order.index("P-start")
+    pend = order.index("P-end")
+    assert any(p0 < i < pend for i in w_idx), order
+    # transcript complete despite async suggestions
+    txt = transcript_text(env_)
+    assert "proveedor" in txt
 
 
 def test_live_mode_pi_session_continuity(env):
@@ -425,6 +458,17 @@ def test_system_prompt_carries_participants():
     assert "Mom Test" in p
     p2 = sug.system_prompt(2)
     assert "2 participants" in p2
+
+
+def test_system_prompt_forces_grounding_and_bans_generic_questions():
+    """Live runs produced batch questions that could be asked in any interview
+    ('¿Qué pasó exactamente, paso a paso...?' x3). The prompt must demand
+    anchoring on the guest's own words and ban unanchored probes."""
+    p = sug.system_prompt(2).lower()
+    assert "exact words" in p, "prompt must require quoting the guest"
+    assert "any other interview" in p, "prompt must ban interchangeable questions"
+    assert "tell me more" in p, "prompt must call out the generic 'tell me more' shape"
+    assert "number" in p, "prompt must push for numbers/names/dates"
 
 
 def test_effective_participants_tui_overrides_args():
