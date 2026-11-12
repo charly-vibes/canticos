@@ -18,7 +18,7 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 | `to-projector` | Convierte video a MKV compatible con proyector (H.264 + AAC estéreo); ordena episodios en estructura Jellyfin `Show (Year)/Season NN/` bajo el directorio de salida |
 | `transcribe` | Transcribe audio a texto con whisper-cli |
 | `meeting-rec` | Graba audio de reuniones (micrófono + salida del sistema en pistas Opus separadas) en un `.mka` hasta Ctrl+C; detección automática de dispositivos via PipeWire |
-| `interview-live` | Copiloto de entrevistas Mom Test: transcribe micrófono + sistema en vivo (diarizado, L/0=entrevistador, R/1=invitado) y sugiere preguntas de seguimiento via pi contra el plan individual qwen — `--from` para replay |
+| `interview-live` | Copiloto de entrevistas Mom Test con dashboard reactivo (curses): al iniciar marca cuántos participantes hay, muestra el transcript en vivo y una cola priorizada de preguntas + temas importantes (los recurrentes suben solos). Transcribe micrófono + sistema en vivo (diarizado, L/0=entrevistador, R/1=invitado) y sugiere preguntas vía pi contra el plan individual qwen — módulos separados (captura/whisper/sugerencias/eventos/cola/dashboard), `events.jsonl` audit trail, `--participants N`, `--no-tui`, `--from` para replay |
 | `terapia` | Consulta CLI en nushell sobre `~/.pi/agent/sessions`: sesiones, tool calls y errores clasificados como JSON — la alternativa estable al heredoc-parser de turno |
 | `fi` | Wrapper de modelos libres (`:free`) para `pi`; alias simples (`laguna`, `nemo2`, `openrouter`) y paso directo; `doctor` / `list` / `--timeout` |
 
