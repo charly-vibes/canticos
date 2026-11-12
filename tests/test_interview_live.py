@@ -10,6 +10,7 @@ and suggestion loop so regressions surface before a real interview.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -144,13 +145,60 @@ def log_lines(env_, name):
 
 
 def out_files(env_, suffix=".txt"):
+    # session-dir layout (canticos-det): artifacts live under root/<session>/
     d = Path(env_['INTERVIEW_DIR'])
-    return sorted(d.glob(f"*{suffix}")) if d.exists() else []
+    return sorted(d.rglob(f"*{suffix}")) if d.exists() else []
 
 
 def transcript_text(env_):
     files = [f for f in out_files(env_) if "transcript" in f.name]
     return files[0].read_text() if files else ""
+
+
+def test_session_directory_layout(env):
+    """canticos-det: artifacts live in <root>/<session>/, not the flat root.
+    --session pins the dir name; repeated runs with the same name append."""
+    r = run(env, "--session", "reunion-test", "--rounds", "1", "--every", "0.2",
+            "--min-segments", "99", live=True)
+    assert r.returncode == 0, r.stderr
+    root = Path(env["INTERVIEW_DIR"])
+    work = root / "reunion-test"
+    assert work.is_dir()
+    assert (work / "transcript.txt").exists()
+    assert (work / "capture.wav").exists()
+    assert (work / "events.jsonl").exists()
+    # root stays clean: only session dirs, no stray artifacts
+    assert not (root / "transcript.txt").exists()
+    assert not (root / "capture.wav").exists()
+    r2 = run(env, "--session", "reunion-test", "--rounds", "1", "--every", "0.2",
+             "--min-segments", "99", live=True)
+    assert r2.returncode == 0, r2.stderr
+    txt = (work / "transcript.txt").read_text()
+    assert txt.count("speaker 0") >= 2  # appended, not clobbered
+
+
+def test_session_dir_auto_name(env):
+    """canticos-det: without --session the dir is interview-YYYYMMDD-HHMMSS
+    and the pi suggestion session carries the same name."""
+    r = run(env, "--rounds", "1", "--every", "0.2", "--min-segments", "1",
+            "--pi-model", "fake-model", live=True)
+    assert r.returncode == 0, r.stderr
+    root = Path(env["INTERVIEW_DIR"])
+    dirs = [d.name for d in root.iterdir() if d.is_dir() and d.name.startswith("interview-")]
+    assert len(dirs) == 1, dirs
+    assert re.fullmatch(r"interview-\d{8}-\d{6}", dirs[0]), dirs
+    pi_calls = log_lines(env, "PI")
+    assert dirs[0] in " ".join(pi_calls[0])  # pi --session-id matches the dir name
+
+
+def test_session_name_rejects_path_traversal(env):
+    """canticos-det: --session is filesystem-safe — no slashes, no '..'."""
+    for bad in ("../escape", "a/b", ".."):
+        r = run(env, "--session", bad, "--rounds", "1", live=True)
+        assert r.returncode == 2, (bad, r.returncode, r.stderr)
+        assert "--session" in r.stderr
+        root = Path(env["INTERVIEW_DIR"])
+        assert not (root / bad).exists()
 
 
 def test_default_language_is_spanish(env):

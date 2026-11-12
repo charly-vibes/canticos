@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -39,13 +40,19 @@ import interview_live_whisper as whisper  # noqa: E402
 class InterviewLive:
     def __init__(self, args):
         self.args = args
+        # Ordered session storage (canticos-det): --out is the ROOT; artifacts
+        # live in <root>/<session>/ so reruns never mix sessions (the flat
+        # reuse caused the leftover-capture.wav bug fixed in 1ffe2f6).
         self.out = Path(args.out or os.environ.get("INTERVIEW_DIR") or str(Path.home() / "Interviews"))
         self.out.mkdir(parents=True, exist_ok=True)
-        self.transcript_path = self.out / "transcript.txt"
-        self.questions_path = self.out / "questions.md"
-        self.queue_path = self.out / "queue.json"
-        self.events_path = self.out / "events.jsonl"
-        self.capture_path = self.out / "capture.wav"
+        self.session_name = (args.session or f"interview-{time.strftime('%Y%m%d-%H%M%S')}")
+        self.work = self.out / self.session_name
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.transcript_path = self.work / "transcript.txt"
+        self.questions_path = self.work / "questions.md"
+        self.queue_path = self.work / "queue.json"
+        self.events_path = self.work / "events.jsonl"
+        self.capture_path = self.work / "capture.wav"
         self.whisper = args.whisper_model or os.environ.get("WHISPER_MODEL") or default_whisper_model()
         self.ffmpeg_proc = None
         self._ffmpeg_err_fh = None
@@ -59,7 +66,6 @@ class InterviewLive:
         self.ui = None  # tui.TuiState when the dashboard is active
         self.log = evlog.EventLog(self.events_path)
         self.started_at = time.time()
-        self.session_name = f"interview-{time.strftime('%Y%m%d-%H%M%S')}"
 
     # -- capture ---------------------------------------------------------------
     def start_capture(self):
@@ -199,7 +205,8 @@ class InterviewLive:
         self.log.emit("session_start", mode="replay" if self.args.from_file
                       else "replay-live" if self.args.replay else "live",
                       participants=self.participants,
-                      pi_model=self.args.pi_model, out=str(self.out))
+                      pi_model=self.args.pi_model, out=str(self.out),
+                      session=self.session_name)
         try:
             self._start_suggester()
             self.start_capture()
@@ -262,11 +269,11 @@ class InterviewLive:
                 time.sleep(self.args.every)
                 if self.ffmpeg_proc.poll() is not None:
                     sys.stderr.write("interview-live: ffmpeg capture exited early — stopping"
-                                     f" (see {self.out / 'ffmpeg.log'})\n")
+                                     f" (see {self.work / 'ffmpeg.log'})\n")
                     break
             if self.args.replay:
                 # slice the next window and transcribe it as if it just arrived
-                win_path = self.out / f"window-{self._replay_pos_ms}.wav"
+                win_path = self.work / f"window-{self._replay_pos_ms}.wav"
                 wr = subprocess.run(
                     cap.build_window_cmd(self.capture_path,
                                          self._replay_pos_ms / 1000.0, window_s, win_path),
@@ -373,7 +380,9 @@ def parse_args(argv):
     p.add_argument("--whisper-model", metavar="PATH", help="Whisper model file (default: best local of ~/models/ggml-large-v3-turbo.bin, ggml-base.bin, or $WHISPER_MODEL)")
     p.add_argument("--language", default="es",
                    help="Whisper language code or 'auto' (default: es — per-window auto misdetects on short clips)")
-    p.add_argument("--out", metavar="DIR", help="Output dir (default: $INTERVIEW_DIR or ~/Interviews)")
+    p.add_argument("--session", metavar="NAME",
+                   help="Session directory name under --out (default: interview-YYYYMMDD-HHMMSS). Reusing a name appends to that session.")
+    p.add_argument("--out", metavar="DIR", help="Sessions ROOT dir — each run works in <out>/<session>/ (default: $INTERVIEW_DIR or ~/Interviews)")
     args = p.parse_args(argv)
     if args.from_file and args.rounds:
         sys.stderr.write("interview-live: --rounds is ignored with --from\n")
@@ -381,6 +390,10 @@ def parse_args(argv):
         p.error("--from and --replay are mutually exclusive")
     if not 1 <= args.participants <= 20:
         p.error("--participants must be between 1 and 20")
+    if args.session is not None and ("/" in args.session or "\\" in args.session
+                                     or ".." in args.session
+                                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._+-]*", args.session)):
+        p.error("--session must be a filesystem-safe name (no slashes, no '..')")
     return args
 
 
