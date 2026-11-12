@@ -18,6 +18,7 @@ scripts=(
     terapia
     fi
     meeting-rec
+    interview-live
 )
 
 for name in "${scripts[@]}"; do
