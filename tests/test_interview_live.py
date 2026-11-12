@@ -153,6 +153,15 @@ def transcript_text(env_):
     return files[0].read_text() if files else ""
 
 
+def test_default_language_is_spanish(env):
+    """Interviews are Spanish; per-window 'auto' misdetects on short clips,
+    so es is the default and --language auto must be requested explicitly."""
+    r = run(env, "--rounds", "1", "--every", "0.2", "--min-segments", "99", live=True)
+    assert r.returncode == 0, r.stderr
+    w = log_lines(env, "WHISPER")
+    assert w[0][w[0].index("-l") + 1] == "es", w[0]
+
+
 def test_default_whisper_model_prefers_best_local(env):
     """Without --whisper-model/$WHISPER_MODEL, pick local large-v3-turbo when
     present (verified better on gold-standard replay), else base path."""

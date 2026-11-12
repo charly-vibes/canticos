@@ -371,7 +371,8 @@ def parse_args(argv):
                    default=os.environ.get("INTERVIEW_PI_MODEL", "qwen-token-plan-individual/qwen3.8-flash"),
                    help="pi model for suggestions (default: $INTERVIEW_PI_MODEL or qwen-token-plan-individual/qwen3.8-flash)")
     p.add_argument("--whisper-model", metavar="PATH", help="Whisper model file (default: best local of ~/models/ggml-large-v3-turbo.bin, ggml-base.bin, or $WHISPER_MODEL)")
-    p.add_argument("--language", default="auto", help="Whisper language code or 'auto' (default: auto)")
+    p.add_argument("--language", default="es",
+                   help="Whisper language code or 'auto' (default: es — per-window auto misdetects on short clips)")
     p.add_argument("--out", metavar="DIR", help="Output dir (default: $INTERVIEW_DIR or ~/Interviews)")
     args = p.parse_args(argv)
     if args.from_file and args.rounds:
