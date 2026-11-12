@@ -46,11 +46,13 @@ def probe_streams(source, timeout=30):
 
 
 def build_live_cmd(mic, monitor, out_path):
-    """Live capture: two pulse inputs mixed to L/R stereo at 16 kHz."""
+    """Live capture: two pulse inputs mixed to L/R stereo at 16 kHz.
+    -y is required: ffmpeg exits instantly (with -nostdin it cannot prompt)
+    when a previous session left capture.wav in the interview dir."""
     flt = ("[0:a]pan=mono|c0=c0[m0];[1:a]pan=mono|c0=c0[m1];"
            "[m0][m1]join=inputs=2:channel_layout=stereo[a]")
     return [
-        "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "warning", "-nostdin",
+        "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "warning", "-nostdin", "-y",
         "-f", "pulse", "-i", mic,
         "-f", "pulse", "-i", monitor,
         "-filter_complex", flt,

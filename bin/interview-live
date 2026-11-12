@@ -47,6 +47,7 @@ class InterviewLive:
         self.capture_path = self.out / "capture.wav"
         self.whisper = args.whisper_model or os.environ.get("WHISPER_MODEL") or str(Path.home() / "models" / "ggml-base.bin")
         self.ffmpeg_proc = None
+        self._ffmpeg_err_fh = None
         self.interrupted = False
         self.participants = args.participants
         self.queue = core.Queue()
@@ -63,11 +64,20 @@ class InterviewLive:
         else:
             mic, monitor = cap.resolve_devices()
             cmd = cap.build_live_cmd(mic, monitor, self.capture_path)
-        self.ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                             stderr=self._open_ffmpeg_log())
         if self.ui:
             self.ui.capture = mode
         self.log.emit("capture_start", mode=mode,
                       source=str(self.args.from_file) if self.args.from_file else None)
+
+    def _open_ffmpeg_log(self):
+        """ffmpeg's stderr lands in <out>/ffmpeg.log so capture failures are
+        diagnosable after the fact (DEVNULL lost every exit reason)."""
+        if self._ffmpeg_err_fh:
+            self._ffmpeg_err_fh.close()
+        self._ffmpeg_err_fh = open(self.out / "ffmpeg.log", "w")
+        return self._ffmpeg_err_fh
 
     def stop_capture(self):
         if self.ffmpeg_proc and self.ffmpeg_proc.poll() is None:
@@ -76,6 +86,9 @@ class InterviewLive:
                 self.ffmpeg_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.ffmpeg_proc.kill()
+        if self._ffmpeg_err_fh:
+            self._ffmpeg_err_fh.close()
+            self._ffmpeg_err_fh = None
         if self.ui:
             self.ui.capture = "stopped"
 
@@ -199,7 +212,8 @@ class InterviewLive:
             else:
                 time.sleep(self.args.every)
                 if self.ffmpeg_proc.poll() is not None:
-                    sys.stderr.write("interview-live: ffmpeg capture exited early — stopping\n")
+                    sys.stderr.write("interview-live: ffmpeg capture exited early — stopping"
+                                     f" (see {self.out / 'ffmpeg.log'})\n")
                     break
             segs = whisper.run_whisper(self.whisper, self.args.language, offset_ms,
                                        self.capture_path, on_error=on_whisper_error)

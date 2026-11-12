@@ -29,6 +29,8 @@ from pathlib import Path
 with open(os.environ['FFMPEG_LOG'], 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
 out = [a for a in sys.argv[1:] if not a.startswith('-')][-1]
+sys.stderr.write('ffmpeg-fake: diagnostic line\\n')
+sys.stderr.flush()
 Path(out).write_bytes(b'RIFF' + b'\\x00' * 400)
 if os.environ.get('FFMPEG_LIVE'):
     time.sleep(60)
@@ -153,6 +155,24 @@ def test_live_mode_capture_argv_and_offsets(env):
     txt = transcript_text(env)
     assert txt.count("proveedor") == 1
     assert "multa" in txt and "speaker 0" in txt and "speaker 1" in txt
+
+
+def test_live_capture_overwrites_stale_file(env):
+    """Regression: with a leftover capture.wav in the interview dir, ffmpeg
+    exits immediately ('File already exists') unless -y is passed — the live
+    argv must include -y so reusing an interview dir starts capturing."""
+    out = Path(env["INTERVIEW_DIR"])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "capture.wav").write_bytes(b"stale-audio")
+    r = run(env, "--rounds", "1", "--every", "1", "--min-segments", "1", live=True)
+    assert r.returncode == 0, r.stderr
+    assert "exited early" not in r.stderr, r.stderr
+    ff = log_lines(env, "FFMPEG")
+    assert ff, "ffmpeg never invoked"
+    assert "-y" in ff[0], ff[0]
+    # ffmpeg stderr is captured to the interview dir for post-mortems
+    errlog = out / "ffmpeg.log"
+    assert errlog.exists() and "diagnostic line" in errlog.read_text()
 
 
 def test_live_mode_pi_session_continuity(env):
