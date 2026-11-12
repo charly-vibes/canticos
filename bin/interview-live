@@ -46,9 +46,11 @@ class InterviewLive:
         self.queue_path = self.out / "queue.json"
         self.events_path = self.out / "events.jsonl"
         self.capture_path = self.out / "capture.wav"
-        self.whisper = args.whisper_model or os.environ.get("WHISPER_MODEL") or str(Path.home() / "models" / "ggml-base.bin")
+        self.whisper = args.whisper_model or os.environ.get("WHISPER_MODEL") or default_whisper_model()
         self.ffmpeg_proc = None
         self._ffmpeg_err_fh = None
+        self._replay_pos_ms = 0
+        self._replay_total_ms = 0
         self._suggest_q = queue.Queue()
         self._suggest_thread = None
         self.interrupted = False
@@ -61,10 +63,12 @@ class InterviewLive:
 
     # -- capture ---------------------------------------------------------------
     def start_capture(self):
-        mode = "replay" if self.args.from_file else "live"
         if self.args.from_file:
-            cmd = cap.build_replay_cmd(self.args.from_file, self.capture_path)
+            mode, cmd = "replay", cap.build_replay_cmd(self.args.from_file, self.capture_path)
+        elif self.args.replay:
+            mode, cmd = "replay-live", cap.build_replay_cmd(self.args.replay, self.capture_path)
         else:
+            mode = "live"
             mic, monitor = cap.resolve_devices()
             cmd = cap.build_live_cmd(mic, monitor, self.capture_path)
         self.ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -192,14 +196,15 @@ class InterviewLive:
                 sys.stderr.write(f"interview-live: {tool} not found — required for {where}\n")
                 raise SystemExit(1)
 
-        self.log.emit("session_start", mode="replay" if self.args.from_file else "live",
+        self.log.emit("session_start", mode="replay" if self.args.from_file
+                      else "replay-live" if self.args.replay else "live",
                       participants=self.participants,
                       pi_model=self.args.pi_model, out=str(self.out))
         try:
             self._start_suggester()
             self.start_capture()
-            if self.args.from_file:
-                # replay: wait for the conversion to finish before transcribing
+            if self.args.from_file or self.args.replay:
+                # replay paths: wait for the conversion before transcribing
                 try:
                     rc = self.ffmpeg_proc.wait(timeout=600)
                 except subprocess.TimeoutExpired:
@@ -208,6 +213,9 @@ class InterviewLive:
                 if rc != 0:
                     sys.stderr.write(f"interview-live: ffmpeg conversion failed (exit {rc})\n")
                     raise SystemExit(1)
+                if self.args.replay:
+                    dur_ms = int(cap.probe_duration(self.capture_path) * 1000)
+                    self._replay_total_ms = dur_ms if dur_ms > 0 else float("inf")
             rounds = self.args.rounds if self.args.rounds else 10**9
             if self.ui:
                 self._run_tui(rounds)
@@ -221,7 +229,9 @@ class InterviewLive:
         finally:
             self.stop_capture()
             self._stop_suggester(timeout=10.0 if self.interrupted else 200.0)
-            self.log.emit("session_end", reason="interrupted" if self.interrupted else "replay" if self.args.from_file else "quit",
+            self.log.emit("session_end", reason="interrupted" if self.interrupted
+                          else "replay" if self.args.from_file
+                          else "replay-live" if self.args.replay else "quit",
                           duration=round(time.time() - self.started_at, 1),
                           transcript_lines=len(self.ui.transcript) if self.ui else 0,
                           questions=len(self.queue.questions), topics=len(self.queue.topics))
@@ -235,6 +245,7 @@ class InterviewLive:
         offset_ms = 0
         first = True
         pending = []
+        window_s = self.args.window or self.args.every
 
         def on_whisper_error(kind, detail=None):
             self.log.emit("whisper_error", kind=kind, detail=detail)
@@ -243,15 +254,33 @@ class InterviewLive:
             if self.interrupted:
                 break
             if self.args.from_file:
-                pass  # conversion already finished above
+                pass  # one-shot: conversion already finished above
+            elif self.args.replay:
+                if self._replay_pos_ms >= self._replay_total_ms:
+                    break  # streamed to the end of the recording
             else:
                 time.sleep(self.args.every)
                 if self.ffmpeg_proc.poll() is not None:
                     sys.stderr.write("interview-live: ffmpeg capture exited early — stopping"
                                      f" (see {self.out / 'ffmpeg.log'})\n")
                     break
-            segs = whisper.run_whisper(self.whisper, self.args.language, offset_ms,
-                                       self.capture_path, on_error=on_whisper_error)
+            if self.args.replay:
+                # slice the next window and transcribe it as if it just arrived
+                win_path = self.out / f"window-{self._replay_pos_ms}.wav"
+                wr = subprocess.run(
+                    cap.build_window_cmd(self.capture_path,
+                                         self._replay_pos_ms / 1000.0, window_s, win_path),
+                    capture_output=True)
+                if wr.returncode != 0:
+                    sys.stderr.write("interview-live: replay window slice failed — stopping\n")
+                    break
+                segs = whisper.run_whisper(self.whisper, self.args.language,
+                                           0, win_path, shift_ms=self._replay_pos_ms,
+                                           on_error=on_whisper_error)
+                self._replay_pos_ms += int(round(window_s * 1000))
+            else:
+                segs = whisper.run_whisper(self.whisper, self.args.language, offset_ms,
+                                           self.capture_path, on_error=on_whisper_error)
             if segs:
                 lines = []
                 for start, end, spk, text in segs:
@@ -307,13 +336,28 @@ class InterviewLive:
             sys.stderr.write(f"interview-live: worker stopped unexpectedly: {errors[0]!r}\n")
 
 
+def default_whisper_model():
+    """Best local model wins: large-v3-turbo markedly outperforms base on
+    domain terms (verified against gold-standard replay), same speed class
+    on GPU builds; falls back to the base path."""
+    models = Path.home() / "models"
+    for name in ("ggml-large-v3-turbo.bin", "ggml-base.bin"):
+        if (models / name).exists():
+            return str(models / name)
+    return str(models / "ggml-base.bin")
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="interview-live",
         description="Live Mom Test interview copilot: transcribe mic+system (diarized) and get pi-suggested follow-up questions.",
     )
     p.add_argument("--from", dest="from_file", metavar="FILE",
-                   help="Replay an existing recording instead of live capture (expects L=interviewer, R=guest stereo or mic-track/system-track).")
+                   help="Replay an existing recording instead of live capture (expects L=interviewer, R=guest stereo or mic-track/system-track). One batch transcription pass.")
+    p.add_argument("--replay", metavar="FILE",
+                   help="Validation mode: stream an existing recording through the rolling window pipeline as if live (no mic), so transcript and suggested questions can be checked against a gold-standard conversation. Works with --tui and --rounds.")
+    p.add_argument("--window", type=float, default=0.0,
+                   help="Audio seconds per transcription window in --replay (default: the --every value)")
     p.add_argument("--rounds", type=int, default=0, help="Transcription rounds before exit (default: infinite until Ctrl+C)")
     p.add_argument("--every", type=float, default=5.0, help="Seconds between transcription passes (default: 5; lower = fresher transcript, more whisper calls)")
     p.add_argument("--min-segments", type=int, default=1, help="New segment lines that trigger a suggestion batch (default: 1)")
@@ -326,12 +370,14 @@ def parse_args(argv):
     p.add_argument("--pi-model", metavar="MODEL",
                    default=os.environ.get("INTERVIEW_PI_MODEL", "qwen-token-plan-individual/qwen3.8-flash"),
                    help="pi model for suggestions (default: $INTERVIEW_PI_MODEL or qwen-token-plan-individual/qwen3.8-flash)")
-    p.add_argument("--whisper-model", metavar="PATH", help="Whisper model file (default: $WHISPER_MODEL or ~/models/ggml-base.bin)")
+    p.add_argument("--whisper-model", metavar="PATH", help="Whisper model file (default: best local of ~/models/ggml-large-v3-turbo.bin, ggml-base.bin, or $WHISPER_MODEL)")
     p.add_argument("--language", default="auto", help="Whisper language code or 'auto' (default: auto)")
     p.add_argument("--out", metavar="DIR", help="Output dir (default: $INTERVIEW_DIR or ~/Interviews)")
     args = p.parse_args(argv)
     if args.from_file and args.rounds:
         sys.stderr.write("interview-live: --rounds is ignored with --from\n")
+    if args.from_file and args.replay:
+        p.error("--from and --replay are mutually exclusive")
     if not 1 <= args.participants <= 20:
         p.error("--participants must be between 1 and 20")
     return args

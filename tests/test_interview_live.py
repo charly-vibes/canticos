@@ -47,7 +47,11 @@ if 'ORDER_LOG' in os.environ:
 with open(os.environ['WHISPER_LOG'], 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
 args = sys.argv
-if '-ot' in args and args[args.index('-ot') + 1] == '0':
+shift = 0
+for a in args:
+    if a.endswith('.wav') and 'window-' in a:
+        shift = int(a.split('window-')[1].split('.wav')[0]) // 1000
+if '-ot' in args and args[args.index('-ot') + 1] == '0' and shift == 0:
     lines = [
         "[00:00:01.000 --> 00:00:04.000]  (speaker 0) Hola, cuentame sobre tu ultimo proyecto",
         "[00:00:05.000 --> 00:00:09.000]  (speaker 1) Bueno, el mes pasado tuvimos un problema con el proveedor",
@@ -63,7 +67,9 @@ print('\\n'.join(lines))
 
 FFPROBE_FAKE = """#!/usr/bin/env python3
 import os, sys
-if 'FFPROBE_OUT' in os.environ:
+if 'format=duration' in ' '.join(sys.argv):
+    sys.stdout.write(os.environ.get('FFPROBE_DURATION', '75.5'))
+elif 'FFPROBE_OUT' in os.environ:
     sys.stdout.write(os.environ['FFPROBE_OUT'])
 else:
     print('2')
@@ -145,6 +151,46 @@ def out_files(env_, suffix=".txt"):
 def transcript_text(env_):
     files = [f for f in out_files(env_) if "transcript" in f.name]
     return files[0].read_text() if files else ""
+
+
+def test_default_whisper_model_prefers_best_local(env):
+    """Without --whisper-model/$WHISPER_MODEL, pick local large-v3-turbo when
+    present (verified better on gold-standard replay), else base path."""
+    r = run(env, "--rounds", "1", "--every", "0.2", "--min-segments", "99", live=True)
+    assert r.returncode == 0, r.stderr
+    w = log_lines(env, "WHISPER")
+    assert w[0][w[0].index("-m") + 1].endswith("ggml-base.bin"), w[0]
+    models = Path(env["HOME"]) / "models"
+    models.mkdir()
+    (models / "ggml-large-v3-turbo.bin").write_bytes(b"ggml")
+    env2 = dict(env, WHISPER_LOG=env["WHISPER_LOG"] + ".2")
+    run(env2, "--rounds", "1", "--every", "0.2", "--min-segments", "99", live=True)
+    w2 = log_lines(env2, "WHISPER")
+    assert w2[0][w2[0].index("-m") + 1].endswith("ggml-large-v3-turbo.bin"), w2[0]
+
+
+def test_replay_mode_windows_like_live(env):
+    """--replay streams an existing recording through the rolling window
+    transcription + suggestion pipeline exactly like a live interview (not the
+    one-shot --from batch), so questions can be validated against a gold-
+    standard conversation without a mic."""
+    src = Path(env["HOME"]) / "gold.wav"
+    src.write_bytes(b"RIFF")
+    env_ = {**env, "FFPROBE_DURATION": "30"}
+    r = run(env_, "--replay", str(src), "--window", "10", "--min-segments", "1")
+    assert r.returncode == 0, r.stderr
+    w = log_lines(env_, "WHISPER")
+    # windows transcribe from 0 (a nonzero -ot would SEEK past the slice);
+    # absolute time is applied as a shift, so timestamps land at 10s/20s/30s
+    assert all(x[x.index("-ot") + 1] == "0" for x in w), w
+    txt = transcript_text(env_)
+    assert "[00:00:01]" in txt, txt
+    assert "[00:00:24]" in txt, "window 2 (10s) must yield 24s-shifted lines: " + txt
+    ff = log_lines(env_, "FFMPEG")
+    assert any("-ss" in x for x in ff[1:]), "no window slicing calls"
+    assert "proveedor" in txt
+    # ran to end of audio without --rounds and flushed suggestions
+    assert "P-end" in Path(env_["ORDER_LOG"]).read_text()
 
 
 def test_live_mode_capture_argv_and_offsets(env):

@@ -38,10 +38,13 @@ def parse_segments(text, offset_ms):
     return segs
 
 
-def run_whisper(whisper_model, language, offset_ms, wav_path, timeout=300, on_error=None):
+def run_whisper(whisper_model, language, offset_ms, wav_path, timeout=300, on_error=None, shift_ms=0):
     """Transcribe new audio since offset_ms. Returns segments; never raises on
     whisper failure — on_error(kind, detail) is called and [] is returned so the
-    interview continues without the round."""
+    interview continues without the round.
+
+    shift_ms: add to all returned timestamps WITHOUT seeking (used by --replay
+    on sliced windows, where -ot would seek past the short window file)."""
     cmd = [
         "whisper-cli", "-m", whisper_model, "-l", language,
         "-di", "-ot", str(offset_ms), "-f", str(wav_path),
@@ -63,4 +66,7 @@ def run_whisper(whisper_model, language, offset_ms, wav_path, timeout=300, on_er
             on_error("exit", r.returncode)
         sys.stderr.write(f"interview-live: whisper-cli failed (exit {r.returncode})\n")
         return []
-    return parse_segments(r.stdout, offset_ms)
+    segs = parse_segments(r.stdout, offset_ms)
+    if shift_ms:
+        segs = [(s + shift_ms, e + shift_ms, sp, t) for s, e, sp, t in segs]
+    return segs

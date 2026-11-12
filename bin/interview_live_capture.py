@@ -60,6 +60,28 @@ def build_live_cmd(mic, monitor, out_path):
     ]
 
 
+def probe_duration(path, timeout=30):
+    """Audio duration in seconds (0.0 on probe failure)."""
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=timeout)
+        return float(p.stdout.strip())
+    except (ValueError, subprocess.SubprocessError, OSError):
+        return 0.0
+
+
+def build_window_cmd(source, start_s, dur_s, out_path):
+    """Slice one replay window [start_s, start_s+dur_s) from the converted
+    file so --replay can stream it as if it had just been captured."""
+    return [
+        "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "warning", "-y",
+        "-ss", f"{start_s:.3f}", "-t", f"{dur_s:.3f}", "-i", str(source),
+        "-vn", "-ac", "2", "-ar", "16000", str(out_path),
+    ]
+
+
 def build_replay_cmd(source, out_path):
     """Replay conversion. Two audio streams (meeting-rec track0=mic /
     track1=monitor) or one stereo stream (channel0=mic, channel1=monitor)."""
