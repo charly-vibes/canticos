@@ -345,6 +345,45 @@ def test_set_speaker_rewrites_transcript(env):
     assert r3.returncode == 2 and "--session" in r3.stderr
 
 
+def test_adopt_moves_legacy_flat_root(env):
+    """canticos-bm7: --adopt moves flat root artifacts into one adopt-<ts>
+    session dir named after the oldest artifact; idempotent afterwards."""
+    root = Path(env["INTERVIEW_DIR"])
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "capture.wav").write_bytes(b"\0" * 512)
+    (root / "transcript.txt").write_text("[00:01:00] (speaker 0) hola\n")
+    (root / "questions.md").write_text("# questions\n")
+    (root / "queue.json").write_text(json.dumps({"questions": [{"text": "q"}], "topics": []}))
+    (root / "events.jsonl").write_text(
+        json.dumps({"ts": 1767248400.0, "seq": 1, "type": "session_start"}) + "\n")
+    (root / "ffmpeg.log").write_text("log\n")
+    (root / "window-5000.wav").write_bytes(b"\0" * 64)  # legacy replay slice
+    r = run(env, "--adopt")
+    assert r.returncode == 0, r.stderr
+    dirs = [d for d in root.iterdir() if d.is_dir()]
+    assert len(dirs) == 1, dirs
+    d = dirs[0]
+    assert d.name.startswith("adopt-")
+    for f in ("capture.wav", "transcript.txt", "questions.md", "queue.json",
+              "events.jsonl", "ffmpeg.log", "window-5000.wav"):
+        assert (d / f).exists(), f
+    assert not (root / "capture.wav").exists()
+    r2 = run(env, "--adopt")  # idempotent: no flat artifacts left
+    assert r2.returncode == 0 and "nothing to adopt" in r2.stdout.lower()
+    assert [x for x in root.iterdir() if x.is_dir()] == [d]
+
+
+def test_adopt_clean_root_is_noop(env):
+    """canticos-bm7: session-organized roots are left alone (exit 0)."""
+    root = Path(env["INTERVIEW_DIR"])
+    make_session(root, "interview-20260101-090000", start_ts=1767248400.0)
+    r = run(env, "--adopt")
+    assert r.returncode == 0, r.stderr
+    assert "nothing to adopt" in r.stdout.lower()
+    r2 = run(env, "--adopt", "--json")
+    assert r2.returncode == 2  # --json stays list-only
+
+
 def test_default_language_is_spanish(env):
     """Interviews are Spanish; per-window 'auto' misdetects on short clips,
     so es is the default and --language auto must be requested explicitly."""

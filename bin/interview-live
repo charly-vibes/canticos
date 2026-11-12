@@ -408,6 +408,8 @@ def parse_args(argv):
     p.add_argument("--set-speaker", metavar="N=NAME", action="append", default=None,
                    dest="set_speaker",
                    help="Post-hoc tagging: rewrite an existing session's transcript labels (requires --session). No re-transcription.")
+    p.add_argument("--adopt", action="store_true",
+                   help="One-time migration: move legacy flat artifacts (capture.wav, transcript.txt, …) from the --out root into an adopt-<ts> session dir so --list shows them")
     p.add_argument("--list", action="store_true",
                    help="List sessions under --out newest-first (name, date, duration, recording, transcript lines, questions) and exit")
     p.add_argument("--json", action="store_true",
@@ -485,7 +487,7 @@ def cmd_set_speaker(work, specs):
 
 
 SESSION_ARTIFACTS = ("events.jsonl", "transcript.txt", "capture.wav",
-                     "questions.md", "queue.json", "speakers.json")
+                     "questions.md", "queue.json", "speakers.json", "ffmpeg.log")
 
 
 def sessions_root(args):
@@ -583,10 +585,42 @@ def cmd_list(root, as_json):
     return 0
 
 
+def cmd_adopt(root):
+    """--adopt (canticos-bm7): move legacy flat artifacts and window-*.wav
+    slices from the root into one adopt-<ts> session dir (named after the
+    oldest artifact). Idempotent: nothing flat -> friendly no-op, exit 0."""
+    if not root.is_dir():
+        sys.stdout.write(f"interview-live: nothing to adopt in {root} (root missing)\n")
+        return 0
+    flat = [a for a in SESSION_ARTIFACTS if (root / a).exists()]
+    windows = sorted(root.glob("window-*.wav"))
+    if not flat and not windows:
+        sys.stdout.write(f"interview-live: nothing to adopt in {root} (no flat artifacts)\n")
+        return 0
+    mtimes = [(root / a).stat().st_mtime for a in flat] + [w.stat().st_mtime for w in windows]
+    base = "adopt-" + time.strftime("%Y%m%d-%H%M%S", time.localtime(min(mtimes)))
+    work = root / base
+    n = 1
+    while work.exists():
+        n += 1
+        work = root / f"{base}-{n}"
+    work.mkdir(parents=True)
+    moved = flat + [w.name for w in windows]
+    for a in flat:
+        os.replace(root / a, work / a)
+    for w in windows:
+        os.replace(w, work / w.name)
+    sys.stdout.write(f"interview-live: adopted {len(moved)} files into {work}\n"
+                     f"  {', '.join(sorted(moved))}\n")
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if args.list:
         raise SystemExit(cmd_list(sessions_root(args), args.json))
+    if args.adopt:
+        raise SystemExit(cmd_adopt(sessions_root(args)))
     if args.set_speaker:
         work = sessions_root(args) / args.session
         if not work.is_dir():
