@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Purpose: Record meeting audio (mic and/or system output) into one Opus file via PipeWire.
+# Responsibilities:
+# - Detect default PulseAudio/PipeWire devices with pactl (source + sink monitor)
+# - Build a minimal ffmpeg invocation with mic/system on separate tracks
+# - Map Ctrl+C/SIGTERM to a graceful stop that still reports the saved file
+# Rationale: canticos-a78 — separate mic/system tracks keep post-meeting volume
+#   fixes possible without re-recording; monitor source captures remote
+#   participants that the mic alone misses.
+#   Job control (set -m) puts ffmpeg in its own process group: a terminal
+#   Ctrl+C would otherwise hit ffmpeg directly AND the trap would forward a
+#   second INT, and ffmpeg's double-INT path aborts the matroska trailer
+#   write, corrupting the file (observed). The idempotent trap guarantees
+#   exactly one SIGINT reaches ffmpeg (its graceful-stop signal).
+#   ffmpeg's stderr goes to a log file, not the tty: under job control its
+#   process group is not the terminal's foreground group, so a tty write
+#   raises SIGTTOU and kills ffmpeg instantly (observed, exit 150).
+set -euo pipefail
+set -m
+
+usage() {
+  echo "Usage: meeting-rec [-m | -s] [-o FILE]"
+  echo ""
+  echo "Records meeting audio until interrupted (Ctrl+C). Default records"
+  echo "your microphone and system audio (remote participants) as two"
+  echo "separate Opus tracks in one .mka file."
+  echo ""
+  echo "Options:"
+  echo "  -m        Record microphone only"
+  echo "  -s        Record system audio (speakers/monitor) only"
+  echo "  -o FILE   Output file (default: \$MEETING_REC_DIR or ~/Meetings/meeting-YYYYMMDD-HHMM.mka)"
+  echo "  -h        Show this help"
+  exit 1
+}
+
+MODE="both"
+OUT=""
+
+while getopts "mso:h" opt; do
+  case "$opt" in
+    m) MODE="mic" ;;
+    s) MODE="sys" ;;
+    o) OUT="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 0 ]] || usage
+
+command -v ffmpeg >/dev/null 2>&1 || { echo "meeting-rec: ffmpeg not found in PATH" >&2; exit 1; }
+command -v pactl  >/dev/null 2>&1 || { echo "meeting-rec: pactl not found in PATH" >&2; exit 1; }
+
+MIC="$(pactl get-default-source)" || { echo "meeting-rec: cannot detect default microphone" >&2; exit 1; }
+SINK="$(pactl get-default-sink)"  || { echo "meeting-rec: cannot detect default output sink" >&2; exit 1; }
+MONITOR="${SINK}.monitor"
+
+if [[ -z "$OUT" ]]; then
+  DIR="${MEETING_REC_DIR:-$HOME/Meetings}"
+  mkdir -p "$DIR"
+  OUT="$DIR/meeting-$(date +%Y%m%d-%H%M%S).mka"
+fi
+
+inputs=(-f pulse -i "$MIC")
+maps=(-map 0)
+if [[ "$MODE" == "mic" ]]; then
+  : # mic already the sole input
+elif [[ "$MODE" == "sys" ]]; then
+  inputs=(-f pulse -i "$MONITOR")
+else
+  inputs+=(-f pulse -i "$MONITOR")
+  maps+=(-map 1)
+fi
+
+interrupted=0
+handled=0
+child=""
+on_signal() {
+  interrupted=1
+  (( handled )) && return 0
+  handled=1
+  # SIGINT is ffmpeg's graceful-stop signal: it still writes the matroska
+  # trailer. SIGTERM aborts the trailer and corrupts the file (observed).
+  [[ -n "$child" ]] && kill -INT "$child" 2>/dev/null || true
+}
+trap on_signal INT TERM
+
+echo "Recording to: $OUT"
+echo "  mic:     $MIC"
+[[ "$MODE" == "both" ]] && echo "  system:  $MONITOR"
+echo "Press Ctrl+C to stop."
+
+log="$OUT.log"
+ffmpeg -hide_banner -nostats -loglevel warning -nostdin -n "${inputs[@]}" "${maps[@]}" -c:a libopus "$OUT" >"$log" 2>&1 &
+child=$!
+
+status=0
+wait "$child" || status=$?
+
+if [[ "$interrupted" -eq 1 ]]; then
+  # Give ffmpeg time to finish the trailer write; escalate only if it hangs.
+  deadline=$((SECONDS + 5))
+  while kill -0 "$child" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.2
+  done
+  if kill -0 "$child" 2>/dev/null; then
+    kill -TERM "$child" 2>/dev/null || true
+    sleep 2
+    kill -KILL "$child" 2>/dev/null || true
+  fi
+  wait "$child" 2>/dev/null || true
+fi
+
+# 255 = ffmpeg killed by SIGINT; 130/143 = our own wait interrupted
+if [[ "$status" -eq 0 || "$status" -eq 255 || "$interrupted" -eq 1 ]]; then
+  rm -f "$log"
+  echo "Saved: $OUT"
+  exit 0
+fi
+
+echo "meeting-rec: ffmpeg failed (exit $status)" >&2
+if [[ -s "$log" ]]; then
+  echo "--- recording log ($log):" >&2
+  tail -5 "$log" >&2
+fi
+exit "$status"

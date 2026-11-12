@@ -17,6 +17,7 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 | `projector-queue` | Procesa la cola `~/Downloads/MOVIES/` a través de `to-projector`; clasifica cada entrada como serie o película y la envía a `~/PROJECTOR/Shows/` o `~/PROJECTOR/Movies/` |
 | `to-projector` | Convierte video a MKV compatible con proyector (H.264 + AAC estéreo); ordena episodios en estructura Jellyfin `Show (Year)/Season NN/` bajo el directorio de salida |
 | `transcribe` | Transcribe audio a texto con whisper-cli |
+| `meeting-rec` | Graba audio de reuniones (micrófono + salida del sistema en pistas Opus separadas) en un `.mka` hasta Ctrl+C; detección automática de dispositivos via PipeWire |
 | `terapia` | Consulta CLI en nushell sobre `~/.pi/agent/sessions`: sesiones, tool calls y errores clasificados como JSON — la alternativa estable al heredoc-parser de turno |
 | `fi` | Wrapper de modelos libres (`:free`) para `pi`; alias simples (`laguna`, `nemo2`, `openrouter`) y paso directo; `doctor` / `list` / `--timeout` |
 
