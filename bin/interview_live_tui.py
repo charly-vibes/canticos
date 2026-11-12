@@ -39,7 +39,7 @@ def role_label(speaker, n):
 class TuiState:
     """Shared state mutated by the worker thread, rendered by the TUI thread."""
 
-    def __init__(self, queue=None):
+    def __init__(self, queue=None, speaker_names=None):
         self.participants = 2
         self.transcript = []          # [(start_ms, speaker, text), ...]
         self.queue = queue or core.Queue()
@@ -47,6 +47,7 @@ class TuiState:
         self.started = time.time()
         self.last_offset_ms = 0
         self.suggestion = "idle"      # idle | thinking | done | error
+        self.speaker_names = speaker_names or {}  # canticos-uzv: id -> {"name"}
 
 
 def _clip(text, width):
@@ -89,7 +90,10 @@ def build_layout(ui, width, height, scroll=0, now=None):
     start = max(0, cap - main_h)
     view = ui.transcript[start:cap]
     transcript = [
-        (spk, _clip(f"[{fmt_ms(ms)}] {role_label(spk, n)}: {text}", left_w))
+        (spk, _clip(f"[{fmt_ms(ms)}] "
+                    + (core.speaker_label(spk, ui.speaker_names)
+                       if str(spk) in ui.speaker_names else role_label(spk, n))
+                    + f": {text}", left_w))
         for ms, spk, text in view
     ]
     scroll = len(ui.transcript) - cap  # clamp scroll to available history

@@ -33,6 +33,23 @@ def normalize_topic(text):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def speaker_label(spk, names):
+    """Human label for a diarized speaker id; unknown ids fall back to 'Speaker N'
+    (canticos-uzv). names maps stringified ids -> {"name": ...} (speakers.json)."""
+    rec = names.get(str(spk)) or {}
+    return rec.get("name") or f"Speaker {spk}"
+
+
+def render_segment_line(start_ms, spk, text, names):
+    """One transcript line. Named speakers render '[ts] Name: text'; unnamed
+    keep the legacy '[ts] (speaker N) text' form so existing consumers and
+    transcripts never shift meaning."""
+    ts = fmt_ms(start_ms)
+    if str(spk) in names:
+        return f"[{ts}] {speaker_label(spk, names)}: {text}"
+    return f"[{ts}] (speaker {spk}) {text}"
+
+
 def _prio(value):
     return value if value in PRIORITY_RANK else "medium"
 

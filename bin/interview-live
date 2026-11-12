@@ -51,6 +51,8 @@ class InterviewLive:
         self.transcript_path = self.work / "transcript.txt"
         self.questions_path = self.work / "questions.md"
         self.queue_path = self.work / "queue.json"
+        self.speakers_path = self.work / "speakers.json"
+        self.speaker_names = self._load_speaker_names(args.speaker)
         self.events_path = self.work / "events.jsonl"
         self.capture_path = self.work / "capture.wav"
         self.whisper = args.whisper_model or os.environ.get("WHISPER_MODEL") or default_whisper_model()
@@ -66,6 +68,25 @@ class InterviewLive:
         self.ui = None  # tui.TuiState when the dashboard is active
         self.log = evlog.EventLog(self.events_path)
         self.started_at = time.time()
+
+    def _load_speaker_names(self, specs):
+        """Merge speakers.json with --speaker specs; persist when specs are
+        given (canticos-uzv). id 0 defaults to 'You' once any naming is active
+        so transcripts read naturally."""
+        names = {}
+        if self.speakers_path.exists():
+            try:
+                loaded = json.loads(self.speakers_path.read_text())
+                if isinstance(loaded, dict):
+                    names = {str(k): v for k, v in loaded.items()
+                             if isinstance(v, dict) and v.get("name")}
+            except (json.JSONDecodeError, OSError):
+                names = {}
+        if specs:
+            names.update({str(k): {"name": v} for k, v in specs.items()})
+            names.setdefault("0", {"name": "You"})
+            self.speakers_path.write_text(json.dumps(names, indent=2, ensure_ascii=False))
+        return names
 
     # -- capture ---------------------------------------------------------------
     def start_capture(self):
@@ -292,7 +313,7 @@ class InterviewLive:
                 lines = []
                 for start, end, spk, text in segs:
                     offset_ms = max(offset_ms, end)
-                    line = f"[{core.fmt_ms(start)}] (speaker {spk}) {text}"
+                    line = core.render_segment_line(start, spk, text, self.speaker_names)
                     lines.append(line)
                     if ui:
                         ui.transcript.append((start, spk, text))
@@ -382,6 +403,11 @@ def parse_args(argv):
                    help="Whisper language code or 'auto' (default: es — per-window auto misdetects on short clips)")
     p.add_argument("--session", metavar="NAME",
                    help="Session directory name under --out (default: interview-YYYYMMDD-HHMMSS). Reusing a name appends to that session.")
+    p.add_argument("--speaker", metavar="N=NAME", action="append", default=None,
+                   help="Name a diarized speaker id for this run, e.g. --speaker 0=You --speaker 1=Ana. Repeatable; persists to speakers.json and renders '[ts] Name: text' in the transcript.")
+    p.add_argument("--set-speaker", metavar="N=NAME", action="append", default=None,
+                   dest="set_speaker",
+                   help="Post-hoc tagging: rewrite an existing session's transcript labels (requires --session). No re-transcription.")
     p.add_argument("--list", action="store_true",
                    help="List sessions under --out newest-first (name, date, duration, recording, transcript lines, questions) and exit")
     p.add_argument("--json", action="store_true",
@@ -400,7 +426,62 @@ def parse_args(argv):
         p.error("--session must be a filesystem-safe name (no slashes, no '..')")
     if args.json and not args.list:
         p.error("--json requires --list")
+    if args.speaker:
+        args.speaker = parse_speaker_specs(p, args.speaker)
+    if args.set_speaker:
+        args.set_speaker = parse_speaker_specs(p, args.set_speaker)
+        if not args.session:
+            p.error("--set-speaker requires --session NAME")
     return args
+
+
+def parse_speaker_specs(parser, values):
+    """['1=Ana', ...] -> {1: 'Ana'}; malformed specs are usage errors."""
+    specs = {}
+    for raw in values or []:
+        sid, sep, name = raw.partition("=")
+        if not sep or not sid.strip().isdigit() or not name.strip():
+            parser.error("--speaker/--set-speaker must be N=Name (e.g. --speaker 1=Ana)")
+        specs[int(sid.strip())] = name.strip()
+    return specs
+
+
+TRANSCRIPT_LINE_RE = re.compile(r"^\[([^\]]+)\]\s+\(speaker (\d+)\)\s?(.*)$")
+
+
+def cmd_set_speaker(work, specs):
+    """Post-hoc tagging (canticos-uzv): rewrite transcript.txt labels for named
+    speakers and persist speakers.json. No re-transcription; unnamed ids keep
+    their legacy markers."""
+    names_path = work / "speakers.json"
+    names = {}
+    if names_path.exists():
+        try:
+            loaded = json.loads(names_path.read_text())
+            if isinstance(loaded, dict):
+                names = {str(k): v for k, v in loaded.items()
+                         if isinstance(v, dict) and v.get("name")}
+        except (json.JSONDecodeError, OSError):
+            names = {}
+    names.update({str(k): {"name": v} for k, v in specs.items()})
+    names.setdefault("0", {"name": "You"})
+    tp = work / "transcript.txt"
+    if not tp.exists():
+        sys.stderr.write(f"interview-live: no transcript in {work} — nothing to tag\n")
+        return 1
+    out_lines, renamed = [], 0
+    for line in tp.read_text().splitlines():
+        m = TRANSCRIPT_LINE_RE.match(line)
+        if m and m.group(2) in names:
+            out_lines.append(f"[{m.group(1)}] {names[m.group(2)]['name']}: {m.group(3)}")
+            renamed += 1
+        else:
+            out_lines.append(line)
+    tp.write_text("\n".join(out_lines) + ("\n" if out_lines else ""))
+    names_path.write_text(json.dumps(names, indent=2, ensure_ascii=False))
+    roster = ", ".join(f"{k}={v['name']}" for k, v in sorted(names.items(), key=lambda kv: int(kv[0])))
+    sys.stdout.write(f"interview-live: tagged {renamed} lines in {work} — {roster}\n")
+    return 0
 
 
 SESSION_ARTIFACTS = ("events.jsonl", "transcript.txt", "capture.wav",
@@ -506,6 +587,12 @@ def main(argv=None):
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if args.list:
         raise SystemExit(cmd_list(sessions_root(args), args.json))
+    if args.set_speaker:
+        work = sessions_root(args) / args.session
+        if not work.is_dir():
+            sys.stderr.write(f"interview-live: no such session: {work}\n")
+            raise SystemExit(1)
+        raise SystemExit(cmd_set_speaker(work, args.set_speaker))
     tool = InterviewLive(args)
     # choose the dashboard: explicit flag wins; otherwise auto when stdout is a
     # real terminal and curses is available (pipes/scripts stay plain)
@@ -513,9 +600,9 @@ def main(argv=None):
         if not (sys.stdout.isatty() and tui.available()):
             sys.stderr.write("interview-live: --tui needs an interactive terminal with curses — use --no-tui\n")
             raise SystemExit(2)
-        tool.ui = tui.TuiState(queue=tool.queue)
+        tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names)
     elif args.tui is None and sys.stdout.isatty() and tui.available():
-        tool.ui = tui.TuiState(queue=tool.queue)
+        tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names)
 
     def handler(signum, frame):
         tool.interrupted = True

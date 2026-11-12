@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 import interview_live_core as core  # noqa: E402
 import interview_live_events as evlog  # noqa: E402
 import interview_live_suggest as sug  # noqa: E402
+import interview_live_whisper as wh  # noqa: E402
 
 BIN = Path(__file__).resolve().parents[1] / "bin" / "interview-live"
 
@@ -281,6 +282,67 @@ def test_list_flags_legacy_flat_root(env):
     r = run(env, "--list")
     assert r.returncode == 0, r.stderr
     assert "--adopt" in r.stdout
+
+
+def test_parse_segments_multidigit_speaker():
+    """canticos-uzv: speaker ids above 9 must parse (regex was single \d)."""
+    txt = "[00:00:01.000 --> 00:00:02.000]  (speaker 12) texto largo"
+    segs = wh.parse_segments(txt, 0)
+    assert segs == [(1000, 2000, 12, "texto largo")]
+
+
+def test_speaker_label_named_and_fallback():
+    """canticos-uzv: known id -> name; unknown -> Speaker N fallback."""
+    assert core.speaker_label(1, {"1": {"name": "Ana"}}) == "Ana"
+    assert core.speaker_label(12, {"12": {"name": "Bruno"}}) == "Bruno"
+    assert core.speaker_label(0, {}) == "Speaker 0"
+
+
+def test_render_segment_line_named_vs_legacy():
+    """canticos-uzv: named speaker renders 'Name: text'; unnamed keeps the
+    legacy '(speaker N)' form so old transcripts/consumers don't shift."""
+    assert core.render_segment_line(65000, 1, "hola", {"1": {"name": "Ana"}}) == "[00:01:05] Ana: hola"
+    assert core.render_segment_line(65000, 1, "hola", {}) == "[00:01:05] (speaker 1) hola"
+
+
+def test_speaker_flag_wires_names_into_transcript(env):
+    """canticos-uzv: --speaker N=Name names speakers in the live transcript
+    and persists speakers.json (unnamed id 0 defaults to You)."""
+    r = run(env, "--speaker", "1=Ana", "--rounds", "1", "--every", "0.2",
+            "--min-segments", "99", live=True)
+    assert r.returncode == 0, r.stderr
+    root = Path(env["INTERVIEW_DIR"])
+    work = next(d for d in root.iterdir() if d.is_dir())
+    txt = (work / "transcript.txt").read_text()
+    assert "Ana: Bueno, el mes pasado" in txt
+    assert "You: Hola, cuentame" in txt
+    spk = json.loads((work / "speakers.json").read_text())
+    assert spk["1"]["name"] == "Ana" and spk["0"]["name"] == "You"
+
+
+def test_set_speaker_rewrites_transcript(env):
+    """canticos-uzv: post-hoc tagging rewrites transcript labels in place and
+    persists speakers.json; the session dir is untouched otherwise."""
+    root = Path(env["INTERVIEW_DIR"])
+    d = root / "sess"
+    d.mkdir(parents=True)
+    (d / "transcript.txt").write_text(
+        "[00:01:00] (speaker 0) hola\n"
+        "[00:02:00] (speaker 1) que tal\n"
+        "[00:03:00] (speaker 1) bien\n")
+    r = run(env, "--session", "sess", "--set-speaker", "1=Ana", "--set-speaker", "0=Bruno")
+    assert r.returncode == 0, r.stderr
+    txt = (d / "transcript.txt").read_text()
+    assert "[00:01:00] Bruno: hola" in txt
+    assert "[00:02:00] Ana: que tal" in txt
+    assert "speaker 0" not in txt and "speaker 1" not in txt
+    spk = json.loads((d / "speakers.json").read_text())
+    assert spk["1"]["name"] == "Ana" and spk["0"]["name"] == "Bruno"
+    # malformed spec is a usage error
+    r2 = run(env, "--session", "sess", "--set-speaker", "Ana")
+    assert r2.returncode == 2 and "--set-speaker" in r2.stderr
+    r3 = run(env, "--set-speaker", "1=Ana")  # needs --session
+    assert r3.returncode == 2 and "--session" in r3.stderr
 
 
 def test_default_language_is_spanish(env):
