@@ -35,6 +35,29 @@ JACCARD_MERGE = 0.7  # token-set overlap at/above this merges paraphrase questio
 DECAY_HALF_LIFE_S = 60.0  # P-13: decay weight halves every minute without evidence
 EXPIRY_THRESHOLD = 0.15  # P-14: below this weight a pending question is retired
 
+# canticos-47b: discovery slots are the learning goals of an interview type.
+# Weights feed the goal-gap rank term; keywords let an untagged question still
+# claim the goal it serves. The default config is the Mom Test's five slots.
+GOAL_STALE_S = 900.0  # a goal with no question for 15 min is stale in the digest
+THREAD_STATES = ("open", "parked", "closed")
+_THREAD_STATE_RANK = {state: i for i, state in enumerate(THREAD_STATES)}
+MOM_TEST_SLOTS = (
+    {"id": "past_event", "label": "A concrete past event", "weight": 5,
+     "keywords": ("when", "last time", "ultima vez", "cuando", "pasado",
+                  "happened")},
+    {"id": "cost", "label": "Cost in time or money", "weight": 4,
+     "keywords": ("cost", "costo", "coste", "cuanto", "pago", "pagaste",
+                  "precio", "pay", "price", "money", "dinero")},
+    {"id": "workaround", "label": "Current workaround", "weight": 3,
+     "keywords": ("workaround", "hiciste", "hacer", "solucion", "usaste",
+                  "usar", "parche")},
+    {"id": "decision", "label": "Decision process", "weight": 2,
+     "keywords": ("decidiste", "decidio", "decision", "elegiste", "choose",
+                  "chose", "why")},
+    {"id": "outcome", "label": "Outcome and aftermath", "weight": 2,
+     "keywords": ("resultado", "consecuencia", "despues", "after", "outcome")},
+)
+
 # Vowel accents only: folding these makes "cuánto"/"cuanto" meet without
 # erasing ñ (año != ano) or any consonant distinction.
 _ACCENT_FOLD = str.maketrans("áéíóúü", "aeiouu")
@@ -109,6 +132,193 @@ def jaccard_score(text_a, text_b):
     return _jaccard_sets(token_set(text_a), token_set(text_b))
 
 
+class ThreadTracker:
+    """Interview threads (topics with a lifecycle), keyed by normalized topic.
+
+    `touch` is the only way questions enter the tracker: the first touch opens
+    the thread, later touches bump its counters. A parked or closed thread is
+    never reopened by new evidence — resurrection needs an explicit `set_state`,
+    so the tracker records the interview's shape instead of oscillating."""
+
+    def __init__(self):
+        self.threads = {}  # normalized key -> thread dict
+        self._lock = threading.RLock()
+
+    def touch(self, text, now=None):
+        """Record a question (or any evidence) under its normalized topic.
+        Returns a copy of the thread, or None for empty text."""
+        now = now if now is not None else time.time()
+        label = str(text or "").strip()
+        key = normalize_topic(label)
+        if not key:
+            return None
+        with self._lock:
+            cur = self.threads.get(key)
+            if cur is None:
+                cur = {"key": key, "label": label, "state": "open",
+                       "first_seen": now, "last_seen": now,
+                       "question_count": 1}
+                self.threads[key] = cur
+            else:
+                cur["last_seen"] = now
+                cur["question_count"] += 1
+                if cur["state"] == "open":
+                    cur["label"] = label  # newest wording, same thread identity
+            return dict(cur)
+
+    def set_state(self, text, state, now=None):
+        """Explicit lifecycle transition (open/parked/closed); None if unknown."""
+        if state not in _THREAD_STATE_RANK:
+            raise ValueError(f"unknown thread state: {state!r}")
+        now = now if now is not None else time.time()
+        key = normalize_topic(text)
+        with self._lock:
+            cur = self.threads.get(key)
+            if cur is None:
+                return None
+            cur["state"] = state
+            cur["last_seen"] = now
+            return dict(cur)
+
+    def park(self, text, now=None):
+        return self.set_state(text, "parked", now)
+
+    def close(self, text, now=None):
+        return self.set_state(text, "closed", now)
+
+    def snapshot(self, now=None):
+        """Serializable threads, open first then most recently touched.
+        `stale` mirrors goal staleness: no touch for GOAL_STALE_S seconds."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            items = []
+            for thread in self.threads.values():
+                item = dict(thread)
+                item["age"] = max(0.0, now - item["last_seen"])
+                item["stale"] = item["age"] >= GOAL_STALE_S
+                items.append(item)
+        items.sort(key=lambda t: (_THREAD_STATE_RANK[t["state"]],
+                                  -t["last_seen"], t["key"]))
+        return items
+
+
+class SlotModel:
+    """Config-driven discovery slots (learning goals) for one interview type.
+
+    Pure helpers: `classify` maps question text to a slot by keyword evidence,
+    `assign` returns question copies with `goal_id` filled, `coverage_state`
+    reports per-slot touch state, and `goal_gap` scores a question by the weight
+    of the slot it would open. Defaults to the Mom Test slots."""
+
+    def __init__(self, slots=None, stale_s=GOAL_STALE_S):
+        raw = MOM_TEST_SLOTS if slots is None else slots
+        self.slots = []
+        for slot in raw:
+            self.slots.append({
+                "id": str(slot["id"]),
+                "label": str(slot.get("label") or slot["id"]),
+                "weight": float(slot.get("weight", 1)),
+                "keywords": tuple(str(k) for k in slot.get("keywords", ())),
+            })
+        self._weights = {slot["id"]: slot["weight"] for slot in self.slots}
+        self.stale_s = float(stale_s)
+
+    def classify(self, text):
+        """Slot id with the most keyword evidence; config order breaks ties.
+        None when nothing matches (the question still ranks, just without gap)."""
+        tokens = token_set(text)
+        if not tokens:
+            return None
+        best, best_hits = None, 0
+        for slot in self.slots:
+            hits = 0
+            for keyword in slot["keywords"]:
+                kw_tokens = token_set(keyword)
+                if kw_tokens and kw_tokens <= tokens:
+                    hits += 1
+            if hits > best_hits:
+                best, best_hits = slot["id"], hits
+        return best
+
+    def goal_id_for(self, question):
+        """Explicit `goal_id` when it names a configured slot, else classify."""
+        goal_id = question.get("goal_id")
+        if goal_id in self._weights:
+            return goal_id
+        return self.classify(question.get("text", ""))
+
+    def assign(self, questions):
+        """Copies of `questions` with `goal_id` filled from keywords; explicit
+        tags always win and unmatched questions stay untagged."""
+        assigned = []
+        for question in questions or []:
+            item = dict(question)
+            if item.get("goal_id") not in self._weights:
+                goal_id = self.classify(item.get("text", ""))
+                if goal_id:
+                    item["goal_id"] = goal_id
+                else:
+                    item.pop("goal_id", None)
+            assigned.append(item)
+        return assigned
+
+    def coverage_state(self, questions=None, now=None):
+        """Per-slot coverage in config order. `covered` means a question touched
+        the slot within `stale_s`; untouched/older slots are `stale`."""
+        now = now if now is not None else time.time()
+        coverage = {}
+        for slot in self.slots:
+            coverage[slot["id"]] = {
+                "id": slot["id"], "label": slot["label"],
+                "weight": slot["weight"], "question_count": 0,
+                "last_seen": None, "age": None,
+                "covered": False, "stale": True,
+            }
+        for question in questions or []:
+            goal_id = self.goal_id_for(question)
+            record = coverage.get(goal_id)
+            if record is None:
+                continue
+            record["question_count"] += 1
+            seen = question.get("last_seen")
+            if seen is not None and (record["last_seen"] is None
+                                     or seen > record["last_seen"]):
+                record["last_seen"] = seen
+        for record in coverage.values():
+            if record["last_seen"] is not None:
+                record["age"] = max(0.0, now - record["last_seen"])
+            record["covered"] = (record["age"] is not None
+                                 and record["age"] < self.stale_s)
+            record["stale"] = not record["covered"]
+        return coverage
+
+    def goal_gap(self, question, questions=None, now=None):
+        """Weight of the slot `question` would open, or 0 when another recent
+        question already covers that slot. This is the per-question goal-gap
+        rank term: it rewards the candidate that reopens an untouched goal."""
+        now = now if now is not None else time.time()
+        goal_id = self.goal_id_for(question)
+        if goal_id is None:
+            return 0.0
+        key = question.get("key")
+        for other in questions or []:
+            if other is question:
+                continue
+            if key is not None and other.get("key") == key:
+                continue
+            if self.goal_id_for(other) != goal_id:
+                continue
+            seen = other.get("last_seen")
+            if seen is not None and now - seen < self.stale_s:
+                return 0.0
+        return self._weights[goal_id]
+
+    def snapshot(self, questions=None, now=None):
+        """Serializable coverage list, config order preserved."""
+        coverage = self.coverage_state(questions, now=now)
+        return [coverage[slot["id"]] for slot in self.slots]
+
+
 def speaker_label(spk, names):
     """Human label for a diarized speaker id; unknown ids fall back to 'Speaker N'
     (canticos-uzv). names maps stringified ids -> {"name": ...} (speakers.json)."""
@@ -172,10 +382,12 @@ def parse_suggestion_output(text):
                     questions.append({"text": str(q.get("text", "")).strip(),
                                       "priority": _prio(q.get("priority")),
                                       "grounds": str(q.get("grounds") or "").strip(),
+                                      "goal_id": str(q.get("goal_id") or "").strip(),
                                       "contract_miss": False})
                 elif q:
                     questions.append({"text": str(q).strip(), "priority": "medium",
-                                      "grounds": "", "contract_miss": False})
+                                      "grounds": "", "goal_id": "",
+                                      "contract_miss": False})
             for t in obj.get("topics") or []:
                 if isinstance(t, dict):
                     topics.append({"name": str(t.get("name", "")).strip(),
@@ -204,9 +416,11 @@ class Queue:
     dashboard iterates ranked views. A new question whose content tokens overlap
     a pending item's by >= JACCARD_MERGE folds into it instead of adding a key."""
 
-    def __init__(self):
+    def __init__(self, threads=None, slots=None):
         self.topics = {}     # normalized key -> topic dict
         self.questions = {}  # normalized key -> question dict
+        self.threads = threads  # ThreadTracker or None (canticos-47b)
+        self.slots = slots      # SlotModel or None (canticos-47b)
         self._lock = threading.RLock()
 
     def ingest(self, questions=None, topics=None, now=None):
@@ -235,15 +449,37 @@ class Queue:
             prio = q.get("priority") if isinstance(q, dict) else "medium"
             extra = ({k: q.get(k) for k in ("grounds", "evidence", "contract_miss")
                       if q.get(k) is not None} if isinstance(q, dict) else {})
+            # canticos-47b: every question references a thread (explicit ref,
+            # else its own normalized text) and, when slots are configured, the
+            # goal it serves (explicit tag wins over keyword classification).
+            thread_ref = None
+            goal_id = None
+            if isinstance(q, dict):
+                thread_ref = " ".join(str(q.get("thread") or "").split()).strip() or None
+                goal_id = str(q.get("goal_id") or "").strip() or None
+            explicit_goal = goal_id is not None
+            if goal_id is None and self.slots is not None:
+                goal_id = self.slots.classify(text)
+            if goal_id:
+                extra["goal_id"] = goal_id
             cur = self.questions.get(key)
             fuzzy = False
             if cur is None:
                 cur = self._match_pending(token_set(text))
                 fuzzy = cur is not None
+            if fuzzy and thread_ref is None:
+                # a paraphrase folds into the original question: same thread
+                thread_ref = cur.get("thread") or cur.get("text")
+            thread_key = normalize_topic(thread_ref or text)
+            if self.threads is not None:
+                touched = self.threads.touch(thread_ref or text, now)
+                if touched:
+                    thread_key = touched["key"]
             if cur is None:
                 cur = {"key": key, "text": text, "priority": prio,
                        "mentions": 1, "added_at": now, "last_seen": now,
-                       "status": "pending", "shown": False, "score": 0, **extra}
+                       "status": "pending", "shown": False, "score": 0,
+                       "thread": thread_key, **extra}
                 self.questions[key] = cur
             else:
                 cur["mentions"] += 1
@@ -251,6 +487,8 @@ class Queue:
                 for k, v in extra.items():
                     if k == "contract_miss":
                         cur[k] = bool(v)
+                    elif k == "goal_id" and not explicit_goal and "goal_id" in cur:
+                        continue  # keep the thread's established goal
                     elif v not in (None, ""):
                         cur[k] = v
                 if fuzzy:
@@ -286,18 +524,41 @@ class Queue:
             return sorted(self.topics.values(),
                           key=lambda t: (-t["score"], -t["last_seen"], t["name"]))
 
-    def ranked_questions(self):
+    def _goal_gaps(self, now):
+        """Per-question goal-gap term; empty when no slot model is configured,
+        which makes the rank key byte-for-byte the pre-canticos-47b one."""
+        if self.slots is None:
+            return {}
+        questions = list(self.questions.values())
+        return {q["key"]: self.slots.goal_gap(q, questions, now=now)
+                for q in questions}
+
+    def ranked_questions(self, now=None):
+        """Score order plus the goal-gap term (canticos-47b): a question that
+        would reopen a heavy, untouched discovery slot outranks an equally
+        scored question on a goal already covered. Ties stay deterministic."""
+        now = now if now is not None else time.time()
         with self._lock:
+            gaps = self._goal_gaps(now)
             return sorted(self.questions.values(),
                           key=lambda q: (0 if q["status"] == "pending" else 1,
-                                         -q["score"], -q["last_seen"], q["text"]))
+                                         -(q["score"] + gaps.get(q["key"], 0.0)),
+                                         -q["last_seen"], q["text"]))
 
-    def pending_questions(self):
+    def pending_questions(self, now=None):
         """Ranked pending view: terminal questions (asked / dismissed /
         expired) never appear. canticos-vvc — lifecycle status is the single
         source of truth for what the interviewer can still act on; canticos-q9j
         adds 'expired' as a terminal status."""
-        return [q for q in self.ranked_questions() if q["status"] == "pending"]
+        return [q for q in self.ranked_questions(now) if q["status"] == "pending"]
+
+    def goal_snapshot(self, now=None):
+        """Goal coverage for the prompt digest / queue.json; None when the
+        session has no slot model (the prompt then has no goals section)."""
+        with self._lock:
+            if self.slots is None:
+                return None
+            return self.slots.snapshot(list(self.questions.values()), now=now)
 
     def top_pending_question(self):
         pending = self.pending_questions()
@@ -357,10 +618,17 @@ class Queue:
         now = now if now is not None else time.time()
         questions = [dict(q, decay_weight=decay_weight(q, now),
                           expires_at=expires_at(q))
-                     for q in self.ranked_questions()]
-        return {
+                     for q in self.ranked_questions(now)]
+        data = {
             "participants": participants,
             "updated_at": updated_at or time.strftime("%Y-%m-%dT%H:%M:%S"),
             "questions": questions,
             "topics": self.ranked_topics(),
         }
+        # canticos-47b: threads/goals are present only when the session tracks
+        # them, so bare Queue() snapshots keep their historical shape.
+        if self.threads is not None:
+            data["threads"] = self.threads.snapshot(now=now)
+        if self.slots is not None:
+            data["goals"] = self.slots.snapshot(questions, now=now)
+        return data

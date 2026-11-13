@@ -196,10 +196,42 @@ def digest_lines(pending, now=None, limit=DIGEST_LIMIT):
     return lines
 
 
-def _prompt_text(new_lines, window, digest, repair):
-    """Assemble the stateless user prompt: rolling window, new lines, digest.
-    The order follows the P-03 spec so trimming can drop the oldest context
-    without reordering the model's attention."""
+def goals_digest_lines(goals, now=None):
+    """LEARNING GOALS digest entries: goal id/label plus last-touch age and a
+    STALE marker when nothing has probed the goal for GOAL_STALE_S seconds
+    (canticos-47b). Accepts SlotModel snapshots or plain goal dicts."""
+    now = now if now is not None else time.time()
+    lines = []
+    for goal in goals or []:
+        if not isinstance(goal, dict):
+            continue
+        goal_id = str(goal.get("id") or goal.get("goal_id") or "").strip()
+        if not goal_id:
+            continue
+        label = str(goal.get("label") or goal.get("name") or goal_id).strip()
+        age = goal.get("age")
+        if age is None and goal.get("last_seen") is not None:
+            age = max(0.0, now - goal["last_seen"])
+        stale = goal.get("stale")
+        if stale is None:
+            stale = age is None or age >= core.GOAL_STALE_S
+        touched = "never" if age is None else f"{age:.0f}s ago"
+        suffix = " [STALE]" if stale else ""
+        lines.append(f"- {goal_id} ({label}): last touch {touched}{suffix}")
+    return lines
+
+
+def _goals_section(goal_lines):
+    return ("## LEARNING GOALS (discovery slots for this interview; tag every "
+            "question with the id of the goal it serves in \"goal_id\"; a "
+            "[STALE] goal has gone untouched — prefer reopening it):\n"
+            + "\n".join(goal_lines))
+
+
+def _prompt_text(new_lines, window, digest, repair, goal_lines=None):
+    """Assemble the stateless user prompt: rolling window, goals, new lines,
+    digest. The order follows the P-03 spec so trimming can drop the oldest
+    context without reordering the model's attention."""
     parts = []
     if repair:
         parts.append(
@@ -210,6 +242,8 @@ def _prompt_text(new_lines, window, digest, repair):
     if window:
         parts.append("RECENT TRANSCRIPT WINDOW (context only; do not re-analyze):\n"
                      + "\n".join(window))
+    if goal_lines:
+        parts.append(_goals_section(goal_lines))
     parts.append("NEW TRANSCRIPT LINES (analyze these):\n" + new_lines)
     if digest:
         parts.append("PENDING QUESTIONS (already suggested — avoid verbatim "
@@ -220,13 +254,16 @@ def _prompt_text(new_lines, window, digest, repair):
 
 
 def build_prompt(new_lines, window_lines=None, pending=None, now=None,
-                 max_chars=PROMPT_BUDGET, contract_chars=0, repair=None):
+                 max_chars=PROMPT_BUDGET, contract_chars=0, repair=None,
+                 goals=None):
     """Stateless content for one suggestion round (canticos-ate).
 
     Enforces the P-03 byte budget by trimming the rolling window first (oldest
-    lines), then the pending digest (lowest-ranked entries). The system contract
-    is never trimmed: `contract_chars` is its length and is reserved up front.
-    Returns at most `max_chars - contract_chars` characters.
+    lines), then the pending digest (lowest-ranked entries), then the goals
+    digest. The system contract is never trimmed: `contract_chars` is its length
+    and is reserved up front. Returns at most `max_chars - contract_chars`
+    characters. With no goals configured the prompt is byte-identical to the
+    pre-canticos-47b content (no LEARNING GOALS section).
     """
     allowance = max(0, int(max_chars) - int(contract_chars))
     if isinstance(new_lines, str):
@@ -235,17 +272,25 @@ def build_prompt(new_lines, window_lines=None, pending=None, now=None,
         new_text = "\n".join(str(line) for line in (new_lines or []))
     window = [str(line) for line in (window_lines or [])]
     digest = digest_lines(pending, now=now)
+    goal_lines = goals_digest_lines(goals, now=now)
     # 1) trim the window from the oldest end
-    while window and len(_prompt_text(new_text, window, digest, repair)) > allowance:
+    while window and len(_prompt_text(new_text, window, digest, repair,
+                                      goal_lines)) > allowance:
         window.pop(0)
     # 2) then trim the digest from its lowest-ranked end
-    while digest and len(_prompt_text(new_text, window, digest, repair)) > allowance:
+    while digest and len(_prompt_text(new_text, window, digest, repair,
+                                      goal_lines)) > allowance:
         digest.pop()
-    # 3) last resort: drop the oldest new lines (still never the contract)
+    # 3) then drop goal entries from the tail (config order keeps the heavies)
+    while goal_lines and len(_prompt_text(new_text, window, digest, repair,
+                                          goal_lines)) > allowance:
+        goal_lines.pop()
+    # 4) last resort: drop the oldest new lines (still never the contract)
     new_parts = new_text.splitlines()
-    while new_parts and len(_prompt_text("\n".join(new_parts), window, digest, repair)) > allowance:
+    while new_parts and len(_prompt_text("\n".join(new_parts), window, digest,
+                                         repair, goal_lines)) > allowance:
         new_parts.pop(0)
-    prompt = _prompt_text("\n".join(new_parts), window, digest, repair)
+    prompt = _prompt_text("\n".join(new_parts), window, digest, repair, goal_lines)
     if len(prompt) > allowance:  # pathological input: hard ceiling, contract intact
         prompt = prompt[:allowance]
     return prompt
@@ -253,7 +298,7 @@ def build_prompt(new_lines, window_lines=None, pending=None, now=None,
 
 def build_pi_cmd(session_name, first, pi_model, participants, ui, transcript_lines,
                  question_model=None, repair=None, window_lines=None, pending=None,
-                 now=None):
+                 now=None, goals=None):
     """pi argv for one stateless suggestion round (canticos-ate).
 
     `--session-id` is deliberately gone: continuity is no longer required for
@@ -261,12 +306,15 @@ def build_pi_cmd(session_name, first, pi_model, participants, ui, transcript_lin
     rolling window, the new lines, and the pending digest. `session_name`/`first`
     remain for call-site compatibility but no longer affect the argv.
     `question_model` overrides --pi-model for this call only (canticos-7h9);
-    `repair` quotes a rejected answer back into the prompt (canticos-ap3).
+    `repair` quotes a rejected answer back into the prompt (canticos-ap3);
+    `goals` is a SlotModel.snapshot list, injected as the LEARNING GOALS digest
+    (canticos-47b) — None/empty keeps the prompt unchanged.
     """
     contract = system_prompt(effective_participants(participants, ui))
     prompt = build_prompt(transcript_lines, window_lines=window_lines,
                           pending=pending, now=now, max_chars=PROMPT_BUDGET,
-                          contract_chars=len(contract), repair=repair)
+                          contract_chars=len(contract), repair=repair,
+                          goals=goals)
     cmd = ["pi", "--print", "--system-prompt", contract]
     model = question_model or pi_model
     if model:

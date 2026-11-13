@@ -73,7 +73,11 @@ class InterviewLive:
         self._suggest_thread = None
         self.interrupted = False
         self.participants = args.participants
-        self.queue = core.Queue()
+        # canticos-47b: thread lifecycle + discovery-slot coverage are session
+        # state; the queue annotates every ingested question with both refs.
+        self.threads = core.ThreadTracker()
+        self.slots = core.SlotModel()
+        self.queue = core.Queue(threads=self.threads, slots=self.slots)
         # canticos-ap3/ate: rendered transcript lines for grounds validation and
         # the stateless rolling window; bounded so a long interview stays cheap.
         self.recent_lines = deque(maxlen=sug.RECENT_WINDOW_LINES)
@@ -252,14 +256,19 @@ class InterviewLive:
                     context = context[:-k]
                     break
         validation_window = context + list(new_lines)
-        pending = self.queue.pending_questions()
+        now = time.time()
+        pending = self.queue.pending_questions(now=now)
+        # canticos-47b: goal coverage from the batches so far becomes the
+        # prompt's LEARNING GOALS digest; it is the same state the ranker uses.
+        goals = self.queue.goal_snapshot(now=now)
         question_model = self.args.question_model
         if self.ui:
             self.ui.suggestion = "thinking"
         cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
                                self.participants, self.ui, input_lines,
                                question_model=question_model,
-                               window_lines=context, pending=pending)
+                               window_lines=context, pending=pending,
+                               now=now, goals=goals)
         # canticos-7h9: the strong model gets a soft 45s budget (P-04); any
         # timeout/failure/nonzero/empty falls back once to --pi-model.
         raw, failure = self._run_pi(
@@ -273,7 +282,8 @@ class InterviewLive:
             model_used = self.args.pi_model
             cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
                                    self.participants, self.ui, input_lines,
-                                   window_lines=context, pending=pending)
+                                   window_lines=context, pending=pending,
+                                   now=now, goals=goals)
             raw, failure = self._run_pi(cmd, sug.PI_TIMEOUT_S)
             degraded = failure is None
         if failure:
@@ -300,7 +310,7 @@ class InterviewLive:
                 self.session_name, True, self.args.pi_model,
                 self.participants, self.ui, input_lines,
                 question_model=model_used, repair=out,
-                window_lines=context, pending=pending)
+                window_lines=context, pending=pending, now=now, goals=goals)
             repair_timeout = (sug.PI_TIMEOUT_S if model_used == self.args.pi_model
                               else sug.QUESTION_MODEL_TIMEOUT_S)
             raw, failure = self._run_pi(repair_cmd, repair_timeout)
@@ -315,6 +325,8 @@ class InterviewLive:
                 self._reject(reasons, None)
                 return
             repaired = True
+        # fill goal_id from slot keywords before ingest; explicit model tags win
+        questions = self.slots.assign(questions)
         self.queue.ingest(questions, topics)
         self._write_queue_json()
         with open(self.questions_path, "a") as fh:

@@ -1416,3 +1416,78 @@ def test_question_model_falls_back_to_pi_model_once(env, monkeypatch, fault, rea
     assert fb["fallback_model"] == "fallback/pi-model"
     assert any(e["type"] == "suggest_result" for e in events)
     assert tool.queue.pending_questions()
+
+
+# -- learning goals in the stateless prompt (canticos-47b) --------------------
+
+def test_goal_digest_marks_stale_goals_and_requests_goal_id():
+    now = 5000.0
+    goals = [
+        {"id": "past_event", "label": "Concrete past event", "last_seen": now - 1200.0},
+        {"id": "cost", "label": "Cost in time or money", "last_seen": now - 10.0},
+        {"id": "outcome", "label": "Outcome"},
+    ]
+    prompt = sug.build_prompt("NEW-LINE", now=now, goals=goals)
+    assert "## LEARNING GOALS" in prompt
+    assert "past_event" in prompt and "Concrete past event" in prompt
+    assert "goal_id" in prompt
+    stale = [line for line in prompt.splitlines()
+             if line.startswith("- ") and "[STALE]" in line]
+    assert len(stale) == 2  # past_event and the never-touched outcome
+    fresh = [line for line in prompt.splitlines() if "cost" in line]
+    assert fresh and "[STALE]" not in fresh[0]
+
+
+def test_prompt_without_goals_is_byte_identical():
+    now = 1000.0
+    pending = [{"text": "¿Cuánto pagaste?", "priority": "high", "last_seen": now}]
+    kwargs = dict(window_lines=["[00:00:01] (speaker 1) old context"],
+                  pending=pending, now=now)
+    baseline = sug.build_prompt("NEW", **kwargs)
+    assert "LEARNING GOALS" not in baseline
+    assert sug.build_prompt("NEW", goals=None, **kwargs) == baseline
+    assert sug.build_prompt("NEW", goals=[], **kwargs) == baseline
+
+
+def test_build_pi_cmd_carries_goals_only_when_configured():
+    now = 1000.0
+    goals = [{"id": "cost", "label": "Cost in time or money", "last_seen": now}]
+    with_goals = sug.build_pi_cmd("s", False, "m", 2, None, "NEW",
+                                  now=now, goals=goals)
+    without = sug.build_pi_cmd("s", False, "m", 2, None, "NEW", now=now)
+    assert "## LEARNING GOALS" in with_goals[-1]
+    assert "cost" in with_goals[-1]
+    assert "## LEARNING GOALS" not in without[-1]
+    assert with_goals[-1] != without[-1]
+
+
+def test_goal_section_stays_inside_the_prompt_budget():
+    goals = [{"id": "cost", "label": "Cost in time or money", "last_seen": 1000.0}]
+    prompt = sug.build_prompt("NEW-ESSENTIAL", now=2000.0, goals=goals,
+                              max_chars=400)
+    assert len(prompt) <= 400
+    assert "NEW-ESSENTIAL" in prompt
+
+
+def test_parse_suggestion_output_keeps_goal_id():
+    out = json.dumps({"questions": [{"text": "¿Cuánto pagaste?", "priority": "high",
+                                     "grounds": "Pagamos una multa",
+                                     "goal_id": "cost"}], "topics": []})
+    questions, _ = core.parse_suggestion_output(out)
+    assert questions[0]["goal_id"] == "cost"
+    accepted, _rejected, _reasons = sug.validate_round(questions, [], WINDOW_ES)
+    assert accepted[0]["goal_id"] == "cost"
+
+
+def test_live_session_injects_goals_and_writes_threads(env):
+    env["PI_MODE"] = "json"
+    r = run(env, "--rounds", "3", "--every", "2", "--min-segments", "1", live=True)
+    assert r.returncode == 0, r.stderr
+    prompts = [call[-1] for call in log_lines(env, "PI")]
+    assert prompts and all("## LEARNING GOALS" in p for p in prompts)
+    des = [f for f in out_files(env, ".json") if "queue" in f.name]
+    assert des, "queue.json never written"
+    data = json.loads(des[0].read_text())
+    assert [g["id"] for g in data["goals"]] == [s["id"] for s in core.MOM_TEST_SLOTS]
+    assert data["threads"]
+    assert all(item["thread"] for item in data["questions"])
