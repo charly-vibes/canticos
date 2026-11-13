@@ -225,7 +225,7 @@
   Branch: main
   Head: 73e5978
   Session: renew-resume (id not exposed)
-  Task: interview-live improvements — canticos-2iv TriggerPolicy implementation
+  Task: interview-live improvements — canticos-2iv TriggerPolicy implementation (superseded by 1af2677262c1c985ce1d2b545862e2cddb7eff46db897b24da5ca764bee69531)
   
   Objective: replace the per-round suggestion enqueue with conversation-driven triggering and stale-batch coalescing (review CORR-003/EDGE-002).
   
@@ -246,3 +246,29 @@
   Unresolved: live-session re-measurement of median batch cadence vs the 21s baseline (mechanism test-proven only); ALIGN-001/002 tickets still unfiled; canticos-c02 possibly closable (dashboard shipped, unverified); 10 commits 1ffe2f6..73e5978 still unpushed.
   
   Previous entry: 5a52b06764118728db39c5c1a6cd7cc0d4de9139829aa9ae96feaf69c8d97539 (supersedes it: its next action was to claim 2iv, now implemented) (supersedes 5a52b06764118728db39c5c1a6cd7cc0d4de9139829aa9ae96feaf69c8d97539)
+- 2026-11-13T16:23:30Z [id:1af2677262c1c985ce1d2b545862e2cddb7eff46db897b24da5ca764bee69531] (#interview-live-improvements) Format: 1
+  Timestamp: 2026-11-13T16:23:30Z
+  Repo: charly-vibes/canticos
+  Branch: main
+  Head: 78a9812
+  Session: orchestrator wave run (id not exposed)
+  Task: interview-live improvement roadmap — all tickets implemented
+  
+  Objective: clear the interview-live backlog (15 tickets + epic decomposition) with TDD → ro5u per ticket, committed per green phase.
+  
+  Current phase: complete/green — 20 commits on top of 73e5978, nothing pushed.
+  
+  State: ALL interview-live tickets closed: 2iv, 4pi, a6q, vvc, q9j, 7h9, ap3, ate, e7a, wrl, 6ic, 8ax, 47b, 4zn, 5rs, c02 (already shipped), plus 93w decomposed into qes/x80/v1v (all closed).
+  - New modules: bin/interview_live_trigger.py, bin/interview_live_metrics.py, bin/interview_live_replay.py; new tests: test_interview_live_queue.py, test_interview_live_metrics.py, test_interview_live_replay.py; fixture tests/fixtures/interview-20261113-slice.jsonl.
+  - Behavior: conversation-driven cadence + stale-batch carry; Jaccard es dedupe; suggest_result audit payload; lifecycle events (shown/asked/dismissed + expired); freshness decay/expiry; --question-model 45s fallback; validate_round + grounds fuzzy match + one repair; stateless 12k prompt with window+pending+goals; NEXT-card TUI (dwell 8s/hysteresis 0.10, backlog, j/k/a/space/d/f); topics context strip + synthesizer; answer capture + validated follow-up; ThreadTracker/SlotModel/goal-gap ranking; replay metrics/sweep/knowledge ledger.
+  - Docs: README interview-live section + corrected stale claims + new flags/boards; CHANGELOG 2026-11-13 entries.
+  
+  Validation: full repo suite 246 passed, 12 pre-existing test_terapia fixture errors (canticos-0cd, out of scope); interview-live surface 178 passed after final docs. python3 -m py_compile bin/*.py clean. Metrics CLI reproduces the measured baseline: 222 batches, 631 questions, 12 no-question batches (5.4%), median cadence 21.24s.
+  
+  Exact next action: push (git push origin main; 20 commits, needs explicit authorization). Optional live validation: run a real interview with the new NEXT card and re-measure cadence/acted-on via bin/interview_live_metrics.py.
+  
+  Decisions: 6ic option A (context strip + synthesizer mentions>=2 & question_count==0); 93w split into qes/x80/v1v; expiry half-life 60s/threshold 0.15; 47b goals digest stale at 900s; ap3 demotes unverifiable grounds (never deletes).
+  
+  Unresolved: no real-device/live-session run of the new TUI or 47b goal ranking (tests + fake-pi only); canticos-0cd and canticos-x13 (terapia) remain open and out of scope; worktree retains unrelated dirt (AGENTS.md, .agents/, dotfiles).
+  
+  Previous entry: 8a0abc8adfe5c95c505d81a7e84b3caef070ab6f95aaedc0c03d92e7f7182da7 (superseded: it recorded 2iv as the pending next action) (supersedes 8a0abc8adfe5c95c505d81a7e84b3caef070ab6f95aaedc0c03d92e7f7182da7)
