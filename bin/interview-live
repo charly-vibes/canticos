@@ -10,6 +10,9 @@
 #     policy (interview_live_trigger), dashboard (tui)
 #   - Own the worker loop (offsets, file artifacts, TUI state mirroring) and the
 #     TUI worker-thread orchestration
+#   - Run the optional --question-model attempt under a soft budget and retry
+#     once on --pi-model (suggest_fallback), so a slow strong model never stalls
+#     the suggestion path
 #   - Append a chronological events.jsonl audit trail for the whole session
 # Rationale: canticos-59c / canticos-c02 / canticos-9x1 — the Mom Test demands
 #   digging into specific past instances; the copilot keeps questions grounded in
@@ -182,38 +185,59 @@ class InterviewLive:
             self._suggest_seq += 1
             self._suggest_q.put((self._suggest_seq, list(lines), first))
 
+    def _run_pi(self, cmd, timeout):
+        """Run one pi suggestion call; returns (raw_stdout, failure_reason).
+        Failure strings match the suggest_error vocabulary so the strong model
+        attempt and the fallback attempt log the same way."""
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            return None, "pi-not-found"
+        except subprocess.TimeoutExpired:
+            return None, "timeout"
+        if r.returncode != 0:
+            return None, f"exit-{r.returncode}"
+        if not r.stdout.strip():
+            return None, "empty"
+        return r.stdout, None
+
+    def _report_pi_failure(self, reason):
+        """Final attempt failed; keeps the pre-canticos-7h9 stderr/event contract."""
+        if reason == "pi-not-found":
+            sys.stderr.write("interview-live: pi not found — suggestions skipped (transcription continues)\n")
+        elif reason == "timeout":
+            sys.stderr.write("interview-live: pi timed out — suggestions skipped\n")
+        elif reason.startswith("exit-"):
+            sys.stderr.write(f"interview-live: pi failed (exit {reason[5:]}) — suggestions skipped\n")
+        if self.ui:
+            self.ui.suggestion = "error"
+        self.log.emit("suggest_error", reason=reason)
+
     def suggest(self, new_lines, first):
         input_lines = "\n".join(new_lines)
-        cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
-                               self.participants, self.ui, input_lines)
+        question_model = self.args.question_model
         if self.ui:
             self.ui.suggestion = "thinking"
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        except FileNotFoundError:
-            sys.stderr.write("interview-live: pi not found — suggestions skipped (transcription continues)\n")
-            if self.ui:
-                self.ui.suggestion = "error"
-            self.log.emit("suggest_error", reason="pi-not-found")
+        cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
+                               self.participants, self.ui, input_lines,
+                               question_model=question_model)
+        # canticos-7h9: the strong model gets a soft 45s budget (P-04); any
+        # timeout/failure/nonzero/empty falls back once to --pi-model.
+        raw, failure = self._run_pi(
+            cmd, sug.QUESTION_MODEL_TIMEOUT_S if question_model else sug.PI_TIMEOUT_S)
+        degraded = False
+        if failure and question_model:
+            self.log.emit("suggest_fallback", reason=failure,
+                          strong_model=question_model,
+                          fallback_model=self.args.pi_model)
+            cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
+                                   self.participants, self.ui, input_lines)
+            raw, failure = self._run_pi(cmd, sug.PI_TIMEOUT_S)
+            degraded = failure is None
+        if failure:
+            self._report_pi_failure(failure)
             return
-        except subprocess.TimeoutExpired:
-            sys.stderr.write("interview-live: pi timed out — suggestions skipped\n")
-            if self.ui:
-                self.ui.suggestion = "error"
-            self.log.emit("suggest_error", reason="timeout")
-            return
-        if r.returncode != 0:
-            sys.stderr.write(f"interview-live: pi failed (exit {r.returncode}) — suggestions skipped\n")
-            if self.ui:
-                self.ui.suggestion = "error"
-            self.log.emit("suggest_error", reason=f"exit-{r.returncode}")
-            return
-        out = r.stdout.strip()
-        if not out:
-            if self.ui:
-                self.ui.suggestion = "error"
-            self.log.emit("suggest_error", reason="empty")
-            return
+        out = raw.strip()
         questions, topics = core.parse_suggestion_output(out)
         self.queue.ingest(questions, topics)
         self._write_queue_json()
@@ -229,11 +253,11 @@ class InterviewLive:
                     fh.write(f"- {t['name']} ({t['priority']}): {t['note']}\n")
         self.log.emit("suggest_result",
                       input_lines=input_lines,
-                      raw_output=r.stdout,
+                      raw_output=raw,
                       questions=[q["text"] for q in questions],
                       topics=topics)
         if self.ui:
-            self.ui.suggestion = "done"
+            self.ui.suggestion = "done (fallback)" if degraded else "done"
         else:
             sys.stdout.write(f"\n--- follow-up questions ({time.strftime('%H:%M:%S')}) ---\n{out}\n\n")
             self._emit_shown()
@@ -241,7 +265,12 @@ class InterviewLive:
     def _emit_shown(self):
         """Plain mode's rendered view is the stdout round, so every unshown
         pending question is one just printed (shown ones were flagged when
-        their batch rendered). canticos-vvc — same event as the TUI frame."""
+        their batch rendered). canticos-vvc — same event as the TUI frame.
+        canticos-q9j — stale questions are expired first (question_dismissed
+        reason='expired') and never printed as live follow-ups."""
+        now = time.time()
+        for q in self.queue.expire_pending(now):
+            tui.emit_question(self.log.emit, "question_dismissed", q, reason="expired")
         for q in self.queue.pending_questions():
             shown = self.queue.mark_shown(q["key"])
             if shown:
@@ -249,7 +278,8 @@ class InterviewLive:
 
     def _write_queue_json(self):
         participants = sug.effective_participants(self.participants, self.ui)
-        data = json.dumps(self.queue.snapshot(participants=participants), indent=2, ensure_ascii=False)
+        data = json.dumps(self.queue.snapshot(participants=participants, now=time.time()),
+                          indent=2, ensure_ascii=False)
         tmp = self.queue_path.with_suffix(".json.tmp")
         tmp.write_text(data)
         os.replace(tmp, self.queue_path)
@@ -462,6 +492,9 @@ def parse_args(argv):
     p.add_argument("--pi-model", metavar="MODEL",
                    default=os.environ.get("INTERVIEW_PI_MODEL", "qwen-token-plan-individual/qwen3.8-flash"),
                    help="pi model for suggestions (default: $INTERVIEW_PI_MODEL or qwen-token-plan-individual/qwen3.8-flash)")
+    p.add_argument("--question-model", metavar="MODEL",
+                   default=os.environ.get("INTERVIEW_QUESTION_MODEL") or None,
+                   help="Stronger pi model for question generation with a 45s soft budget; on timeout/failure it falls back to --pi-model (default: $INTERVIEW_QUESTION_MODEL; unset = no strong-model pass)")
     p.add_argument("--whisper-model", metavar="PATH", help="Whisper model file (default: best local of ~/models/ggml-large-v3-turbo.bin, ggml-base.bin, or $WHISPER_MODEL)")
     p.add_argument("--language", default="es",
                    help="Whisper language code or 'auto' (default: es — per-window auto misdetects on short clips)")

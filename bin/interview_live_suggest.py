@@ -10,7 +10,12 @@ Rationale: canticos-9x1 + canticos-c02 — the participant count entered in the
   dashboard never reached the model (CORR-001); the fix is a single resolution
   point used by both the prompt and the queue snapshot. Keeping the prompt and
   argv construction here makes suggestion behavior testable without spawning pi.
+  canticos-7h9 — an optional stronger question model rides the same argv builder;
+  its soft budget (P-04, 45s) is injectable so tests never wait on a real clock.
 """
+
+QUESTION_MODEL_TIMEOUT_S = 45.0  # P-04: soft budget for --question-model before fallback
+PI_TIMEOUT_S = 180.0  # default pi budget for the fallback / pre-flag path
 
 MOM_SYSTEM_PROMPT = """You are a Mom Test interviewing coach (methodology from Rob Fitzpatrick's "The Mom Test").
 
@@ -71,11 +76,16 @@ def system_prompt(participants):
     )
 
 
-def build_pi_cmd(session_name, first, pi_model, participants, ui, transcript_lines):
+def build_pi_cmd(session_name, first, pi_model, participants, ui, transcript_lines,
+                 question_model=None):
+    """pi argv for one suggestion round. `question_model` overrides --pi-model
+    for this call only (canticos-7h9); when unset the argv is byte-identical to
+    the pre-flag default so the existing suggestion path never shifts."""
     cmd = ["pi", "--session-id", session_name, "--print"]
     if first:
         cmd += ["--system-prompt", system_prompt(effective_participants(participants, ui))]
-    if pi_model:
-        cmd += ["--model", pi_model]
+    model = question_model or pi_model
+    if model:
+        cmd += ["--model", model]
     cmd += [transcript_lines]
     return cmd

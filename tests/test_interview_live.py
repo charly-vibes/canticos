@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,14 @@ if 'ORDER_LOG' in os.environ:
         fh.write('P-start\\n')
 with open(os.environ['PI_LOG'], 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
+# canticos-7h9: keyed on the --model value so the strong-model attempt can
+# time out or fail while the --pi-model fallback still succeeds.
+model = sys.argv[sys.argv.index('--model') + 1] if '--model' in sys.argv else ''
+if model and model == os.environ.get('PI_SLOW_MODEL'):
+    time.sleep(float(os.environ.get('PI_SLOW_S', '2')))
+if model and model == os.environ.get('PI_FAIL_MODEL'):
+    print("pi: provider error", file=sys.stderr)
+    sys.exit(1)
 if os.environ.get('PI_FAIL'):
     print("pi: provider error", file=sys.stderr)
     sys.exit(1)
@@ -1044,3 +1053,109 @@ def test_plain_mode_emits_question_shown(env):
         assert e["priority"] in ("high", "medium", "low")
     assert len(shown) == len({e["key"] for e in shown}), "question_shown re-emitted"
     assert not [e for e in lines if e["type"] == "question_asked"]
+
+
+# -- question model (canticos-7h9) --------------------------------------------
+
+DEFAULT_PI_MODEL = "qwen-token-plan-individual/qwen3.8-flash"
+STRONG_MODEL = "strong/question-model"
+
+
+def load_cli_module():
+    """Import the extension-less coordinator as a module for in-process tests."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("interview_live_cli_test", str(BIN))
+    spec = importlib.util.spec_from_loader("interview_live_cli_test", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def session_events(env_, session):
+    path = Path(env_["INTERVIEW_DIR"]) / session / "events.jsonl"
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
+
+
+def test_question_model_unset_pins_default_pi_argv(env):
+    """Anti-goal: with --question-model unset the pi argv is byte-identical to
+    the pre-flag default (one call, one --model, no extra flags)."""
+    rec = Path(env['HOME']) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run(env, "--from", str(rec), "--session", "argv-pin")
+    assert r.returncode == 0, r.stderr
+    calls = log_lines(env, "PI")
+    assert len(calls) == 1
+    result = next(e for e in session_events(env, "argv-pin") if e["type"] == "suggest_result")
+    assert calls[0] == [
+        "--session-id", "argv-pin", "--print",
+        "--system-prompt", sug.system_prompt(2),
+        "--model", DEFAULT_PI_MODEL,
+        result["input_lines"],
+    ]
+    assert not [e for e in session_events(env, "argv-pin") if e["type"] == "suggest_fallback"]
+
+
+def test_question_model_flag_and_env_used_by_suggestion_path(env):
+    """--question-model (and $INTERVIEW_QUESTION_MODEL) replace the model for
+    the suggestion call; --pi-model stays the fallback default."""
+    rec = Path(env['HOME']) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run(env, "--from", str(rec), "--session", "qm-flag",
+            "--question-model", STRONG_MODEL)
+    assert r.returncode == 0, r.stderr
+    calls = log_lines(env, "PI")
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--model") + 1] == STRONG_MODEL
+    assert not [e for e in session_events(env, "qm-flag") if e["type"] == "suggest_fallback"]
+
+    r2 = run({**env, "INTERVIEW_QUESTION_MODEL": "env/question-model"},
+             "--from", str(rec), "--session", "qm-env")
+    assert r2.returncode == 0, r2.stderr
+    calls2 = log_lines(env, "PI")
+    assert len(calls2) == 2
+    assert calls2[-1][calls2[-1].index("--model") + 1] == "env/question-model"
+
+
+@pytest.mark.parametrize("fault,reason", [
+    ({"PI_SLOW_MODEL": STRONG_MODEL, "PI_SLOW_S": "2"}, "timeout"),
+    ({"PI_FAIL_MODEL": STRONG_MODEL}, "exit-1"),
+])
+def test_question_model_falls_back_to_pi_model_once(env, monkeypatch, fault, reason):
+    """A slow/failing strong model falls back once to --pi-model within the
+    injectable soft budget, emits suggest_fallback, and marks the TUI status
+    'done (fallback)'."""
+    rec = Path(env["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    # subprocess inherits the real os.environ mapping, so mutate it in place
+    for key, value in dict(env, **fault).items():
+        monkeypatch.setenv(key, value)
+    mod = load_cli_module()
+    args = mod.parse_args(["--from", str(rec), "--session", "qm-fallback",
+                           "--question-model", STRONG_MODEL,
+                           "--pi-model", "fallback/pi-model"])
+    tool = mod.InterviewLive(args)
+
+    class UiStub:
+        participants = 2
+        suggestion = "idle"
+
+    tool.ui = UiStub()
+    monkeypatch.setattr(sug, "QUESTION_MODEL_TIMEOUT_S", 0.3)
+    started = time.monotonic()
+    tool.suggest(["[00:00:01] (speaker 1) hola"], True)
+    elapsed = time.monotonic() - started
+    tool.log.close()
+    assert elapsed < 2.0, elapsed  # P-04 soft budget is injectable, not real 45s
+    calls = log_lines(env, "PI")
+    assert [c[c.index("--model") + 1] for c in calls] == [STRONG_MODEL, "fallback/pi-model"]
+    assert tool.ui.suggestion == "done (fallback)"
+    events = session_events(env, "qm-fallback")
+    fallbacks = [e for e in events if e["type"] == "suggest_fallback"]
+    assert len(fallbacks) == 1
+    fb = fallbacks[0]
+    assert fb["reason"] == reason
+    assert fb["strong_model"] == STRONG_MODEL
+    assert fb["fallback_model"] == "fallback/pi-model"
+    assert any(e["type"] == "suggest_result" for e in events)
+    assert tool.queue.pending_questions()

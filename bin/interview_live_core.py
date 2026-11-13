@@ -6,8 +6,10 @@ Responsibilities:
     mention counts (recurrence raises priority); questions dedupe by normalized
     text and merge paraphrases of the same pending question by token overlap
   - Rank items so the dashboard shows "what matters right now" first
-  - Track question lifecycle status (pending / asked / dismissed) and a
-    first-render `shown` flag so events fire exactly once per question
+  - Track question lifecycle status (pending / asked / dismissed / expired) and
+    a first-render `shown` flag so events fire exactly once per question
+  - Decay pending questions by staleness (time since last evidence) and expire
+    them below the threshold; fresh evidence resets the decay clock
 Rationale: canticos-c02 — the reactive TUI needs a small, unit-testable model
   decoupled from ffmpeg/whisper/pi subprocesses and from curses rendering. Tests
   import this module directly; the script and the TUI both share this one queue.
@@ -15,9 +17,13 @@ Rationale: canticos-c02 — the reactive TUI needs a small, unit-testable model
   token-set Jaccard (after a light es normalization) folds variants together.
   canticos-vvc — question lifecycle events need a status API and a shown flag
   here, where transitions happen, so TUI and plain mode share one truth.
+  canticos-q9j — 41 evergreen pending items survived a 628-item backlog; decay
+  is pure and injectable (P-13 half-life, P-14 threshold) and acts on staleness,
+  never on mere existence, so a re-mentioned question survives.
 """
 
 import json
+import math
 import re
 import threading
 import time
@@ -26,6 +32,8 @@ PRIORITY_BASE = {"high": 100, "medium": 60, "low": 30}
 PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
 RECURRENCE_BONUS = 40  # added per extra mention beyond the first
 JACCARD_MERGE = 0.7  # token-set overlap at/above this merges paraphrase questions
+DECAY_HALF_LIFE_S = 60.0  # P-13: decay weight halves every minute without evidence
+EXPIRY_THRESHOLD = 0.15  # P-14: below this weight a pending question is retired
 
 # Vowel accents only: folding these makes "cuánto"/"cuanto" meet without
 # erasing ñ (año != ano) or any consonant distinction.
@@ -114,6 +122,19 @@ def score_for(priority, mentions):
     """Priority score: base by importance + recurrence bonus per extra mention."""
     base = PRIORITY_BASE.get(_prio(priority), 60)
     return base + (int(mentions) - 1) * RECURRENCE_BONUS
+
+
+def decay_weight(q, now, half_life=DECAY_HALF_LIFE_S):
+    """Staleness weight in (0, 1]: halves every `half_life` seconds since the
+    question's last evidence (last_seen). Pure; clock skew never boosts above 1."""
+    age = max(0.0, now - q["last_seen"])
+    return 0.5 ** (age / half_life)
+
+
+def expires_at(q, half_life=DECAY_HALF_LIFE_S, threshold=EXPIRY_THRESHOLD):
+    """Epoch second at which the question's decay weight reaches `threshold`
+    (the expiry boundary; expiry itself triggers strictly below it)."""
+    return q["last_seen"] + half_life * math.log2(1.0 / threshold)
 
 
 def parse_suggestion_output(text):
@@ -247,9 +268,10 @@ class Queue:
                                          -q["score"], -q["last_seen"], q["text"]))
 
     def pending_questions(self):
-        """Ranked pending view: asked and dismissed questions never appear.
-        canticos-vvc — lifecycle status is the single source of truth for what
-        the interviewer can still act on."""
+        """Ranked pending view: terminal questions (asked / dismissed /
+        expired) never appear. canticos-vvc — lifecycle status is the single
+        source of truth for what the interviewer can still act on; canticos-q9j
+        adds 'expired' as a terminal status."""
         return [q for q in self.ranked_questions() if q["status"] == "pending"]
 
     def top_pending_question(self):
@@ -286,11 +308,34 @@ class Queue:
         out of every pending view, and it never re-emits as shown."""
         return self._transition(key, "dismissed")
 
-    def snapshot(self, participants=None, updated_at=None):
-        """Serializable state, written to queue.json for archival/debug."""
+    def expire_pending(self, now=None, half_life=DECAY_HALF_LIFE_S,
+                       threshold=EXPIRY_THRESHOLD):
+        """Retire pending questions whose decay weight fell below `threshold`
+        (canticos-q9j). Idempotent: only the transitions made in this call are
+        returned, most stale first, so callers emit one event per expiry."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            expired = []
+            for q in self.questions.values():
+                if q["status"] != "pending":
+                    continue
+                if decay_weight(q, now, half_life) < threshold:
+                    q["status"] = "expired"
+                    expired.append(dict(q))
+            expired.sort(key=lambda q: (q["last_seen"], q["key"]))
+            return expired
+
+    def snapshot(self, participants=None, updated_at=None, now=None):
+        """Serializable state, written to queue.json for archival/debug.
+        Carries the decay inputs at snapshot time: every question gets its
+        decay_weight and expires_at so stale-but-live items are diagnosable."""
+        now = now if now is not None else time.time()
+        questions = [dict(q, decay_weight=decay_weight(q, now),
+                          expires_at=expires_at(q))
+                     for q in self.ranked_questions()]
         return {
             "participants": participants,
             "updated_at": updated_at or time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "questions": self.ranked_questions(),
+            "questions": questions,
             "topics": self.ranked_topics(),
         }

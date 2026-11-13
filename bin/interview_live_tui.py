@@ -43,11 +43,12 @@ def _noop_emit(_etype, **_payload):
     """Default sink: pure layout and unit tests need no EventLog."""
 
 
-def emit_question(emit, etype, q):
+def emit_question(emit, etype, q, **extra):
     """Shared emit helper: every question lifecycle event carries the same
-    identity payload (key/text/priority/score), so jq filters stay stable."""
+    identity payload (key/text/priority/score), so jq filters stay stable.
+    Extra fields (e.g. reason='expired') ride along verbatim."""
     emit(etype, key=q["key"], text=q["text"],
-         priority=q["priority"], score=q["score"])
+         priority=q["priority"], score=q["score"], **extra)
 
 
 class TuiState:
@@ -65,9 +66,19 @@ class TuiState:
         self.speaker_names = speaker_names or {}  # canticos-uzv: id -> {"name"}
         self.emit = emit or _noop_emit  # canticos-vvc: event sink (EventLog.emit)
 
-    def note_shown(self, q):
-        """Render hook: emit question_shown the first time a pending question
-        appears in the view; later frames are no-ops (queue owns the flag)."""
+    def expire_stale(self, now=None):
+        """Retire stale pending questions (canticos-q9j) and emit one
+        question_dismissed(reason='expired') per transition. Idempotent."""
+        expired = self.queue.expire_pending(now)
+        for q in expired:
+            emit_question(self.emit, "question_dismissed", q, reason="expired")
+        return expired
+
+    def note_shown(self, q, now=None):
+        """Render hook: expire stale questions first, then emit question_shown
+        the first time a still-pending question appears in the view; later
+        frames are no-ops (queue owns the flag)."""
+        self.expire_stale(now)
         shown = self.queue.mark_shown(q["key"])
         if shown:
             emit_question(self.emit, "question_shown", shown)
@@ -103,9 +114,10 @@ def build_layout(ui, width, height, scroll=0, now=None):
     """No curses and no direct I/O — unit-testable.
 
     Returns a dict with header / transcript / queue / footer line lists and the
-    transcript scroll position. The single side effect is the question_shown
-    lifecycle emit through ui.emit (no-op by default) for pending questions
-    entering the queue pane. Rendering (colors, cursor) is an orthagonal,
+    transcript scroll position. Side effects, both through ui.emit (no-op by
+    default): stale pending questions are expired (question_dismissed with
+    reason='expired', canticos-q9j) and pending questions entering the queue
+    pane emit question_shown. Rendering (colors, cursor) is an orthagonal,
     untested thin layer in draw().
     """
     now = now if now is not None else time.time()
@@ -142,7 +154,10 @@ def build_layout(ui, width, height, scroll=0, now=None):
     cap_q = max(0, main_h - 1)
     entries = []  # (kind, priority_mark, text, status, priority)
     pending_rendered = []  # canticos-vvc: pending questions in this frame's view
+    ui.expire_stale(now)  # canticos-q9j: retire stale questions before rendering
     for q in ui.queue.ranked_questions():
+        if q["status"] == "expired":
+            continue  # dismissed for good; the audit trail stays in queue.json
         mark = "*" if q["priority"] == "high" else ("+" if q["priority"] == "medium" else "-")
         prefix = "[x] " if q["status"] == "asked" else f"{mark} "
         entries.append(("Q", prefix + q["text"], q["status"], q["priority"]))
@@ -153,9 +168,10 @@ def build_layout(ui, width, height, scroll=0, now=None):
         entries.append(("T", f"{mark} {t['name']} x{t['mentions']}", "topic", t["priority"]))
     queue = [e for e in entries[:cap_q]]
     # Pending questions sort first, so the pane's first cap_q rows are exactly
-    # pending_rendered[:cap_q]; emitting is build_layout's only side effect.
+    # pending_rendered[:cap_q]; expiry + shown emits are build_layout's only
+    # side effects.
     for q in pending_rendered[:cap_q]:
-        ui.note_shown(q)
+        ui.note_shown(q, now)
 
     footer = _clip(
         "q quit | space: mark top question asked | f: ask now | PgUp/PgDn: scroll",

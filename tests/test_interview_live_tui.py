@@ -272,3 +272,39 @@ def test_dismissed_question_never_pending_nor_shown_again():
     assert [q["key"] for q in ui.queue.pending_questions()] == []
     tui.build_layout(ui, 100, 24)
     assert [p for e, p in events if e == "question_shown"] == []
+
+
+# ---------------------------------------------------------------------------
+# expiry events (canticos-q9j)
+# ---------------------------------------------------------------------------
+
+def test_build_layout_expires_stale_questions_and_emits_dismissed():
+    """Rendering retires stale pending questions: question_dismissed with
+    reason='expired' fires once, and the question leaves the pane."""
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "vieja pregunta", "priority": "high"}],
+                    now=1000.0)
+    key = ui.queue.top_pending_question()["key"]
+    stale_now = core.expires_at(ui.queue.questions[key]) + 1.0
+    lay = tui.build_layout(ui, 100, 24, now=stale_now)
+    assert not any("vieja pregunta" in text for _, text, _, _ in lay["queue"])
+    dismissed = [p for e, p in events if e == "question_dismissed"]
+    assert len(dismissed) == 1
+    assert dismissed[0]["key"] == key and dismissed[0]["reason"] == "expired"
+    assert ui.queue.questions[key]["status"] == "expired"
+    # next frame: nothing new to expire, no duplicate event
+    tui.build_layout(ui, 100, 24, now=stale_now + 60)
+    assert [e for e, _ in events] == ["question_dismissed"]
+
+
+def test_note_shown_expires_before_shown_emission():
+    """A question that went stale is dismissed (reason='expired') instead of
+    being marked shown."""
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "pregunta caduca", "priority": "medium"}],
+                    now=1000.0)
+    q = ui.queue.top_pending_question()
+    ui.note_shown(q)  # real clock is far past last_seen
+    assert [e for e, _ in events] == ["question_dismissed"]
+    assert events[0][1]["reason"] == "expired"
+    assert ui.queue.questions[q["key"]]["shown"] is False
