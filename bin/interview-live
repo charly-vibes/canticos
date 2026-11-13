@@ -162,6 +162,16 @@ class InterviewLive:
                 item = self._suggest_q.get()
                 if item is None:
                     break
+                if isinstance(item, dict) and item.get("kind") == "followup":
+                    try:
+                        self.generate_followup(item["question"], item["answer"])
+                    except Exception as e:  # noqa: BLE001 — follow-up failures are logged, never fatal
+                        try:
+                            self.log.emit("followup_error",
+                                          reason=f"thread:{type(e).__name__}:{e}")
+                        except Exception:  # noqa: BLE001 — log may be closing
+                            pass
+                    continue
                 seq, lines = item
                 carry.extend(lines)
                 with self._suggest_lock:
@@ -198,6 +208,58 @@ class InterviewLive:
         with self._suggest_lock:
             self._suggest_seq += 1
             self._suggest_q.put((self._suggest_seq, list(lines)))
+
+    # -- answer-driven follow-ups (canticos-8ax) -----------------------------
+    def enqueue_followup(self, question, answer):
+        """TUI ask hook: hand ONE answer-driven follow-up to the background
+        suggester and return immediately. The dashboard thread never waits on
+        pi; validation and ingestion happen on the suggester thread."""
+        self._suggest_q.put({"kind": "followup",
+                             "question": dict(question),
+                             "answer": str(answer)})
+
+    def generate_followup(self, question, answer):
+        """Generate at most one follow-up from a captured answer, through the
+        same pi contract and `sug.validate_round` gate as a normal round.
+        Failures are logged and swallowed: asking must never crash a session."""
+        try:
+            self.log.emit("followup_trigger", question=question.get("text"),
+                          answer=answer)
+            now = time.time()
+            cmd = sug.followup_cmd(
+                question.get("text", ""), answer,
+                participants=sug.effective_participants(self.participants, self.ui),
+                pi_model=self.args.pi_model,
+                question_model=self.args.question_model)
+            raw, failure = self._run_pi(
+                cmd, sug.QUESTION_MODEL_TIMEOUT_S if self.args.question_model
+                else sug.PI_TIMEOUT_S)
+            if failure:
+                self.log.emit("followup_error", reason=failure)
+                return None
+            accepted, rejected, reasons = sug.validate_followup(
+                raw, self._recent_snapshot())
+            if not accepted:
+                self.log.emit("followup_reject", reasons=reasons,
+                              rejected=rejected)
+                return None
+            candidate = dict(accepted[0])
+            candidate.setdefault("priority", "medium")
+            candidate["source"] = "followup"
+            candidate["thread"] = question.get("thread") or question.get("text")
+            candidate = self.slots.assign([candidate])[0]
+            self.queue.ingest([candidate], now=now)
+            self._write_queue_json()
+            self.log.emit("followup_result", question=candidate["text"],
+                          source="answer", answer=answer, reasons=reasons)
+            return candidate
+        except Exception as e:  # noqa: BLE001 — never let a follow-up kill the worker
+            try:
+                self.log.emit("followup_error",
+                              reason=f"{type(e).__name__}: {e}")
+            except Exception:  # noqa: BLE001
+                pass
+            return None
 
     def _recent_snapshot(self):
         """Copy the rolling window under a lock: the suggester thread reads it
@@ -912,6 +974,10 @@ def main(argv=None):
     elif args.tui is None and sys.stdout.isatty() and tui.available():
         tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names,
                                emit=tool.log.emit)
+    if tool.ui is not None:
+        # canticos-8ax: a captured answer queues one follow-up on the
+        # suggester thread; the dashboard never blocks on the model.
+        tool.ui.followup = tool.enqueue_followup
 
     def handler(signum, frame):
         tool.interrupted = True

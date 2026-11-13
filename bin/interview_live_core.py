@@ -5,6 +5,10 @@ Responsibilities:
   - Maintain a prioritized queue: topics dedupe by normalized name and accumulate
     mention counts (recurrence raises priority); questions dedupe by normalized
     text and merge paraphrases of the same pending question by token overlap
+  - Keep topics as context state: a recurring topic with no question yields one
+    deterministic low-priority candidate (canticos-6ic) that never outranks a
+    grounded question
+  - Record an optional one-line answer on the ask transition (canticos-8ax)
   - Rank items so the dashboard shows "what matters right now" first
   - Track question lifecycle status (pending / asked / dismissed / expired) and
     a first-render `shown` flag so events fire exactly once per question
@@ -34,6 +38,14 @@ RECURRENCE_BONUS = 40  # added per extra mention beyond the first
 JACCARD_MERGE = 0.7  # token-set overlap at/above this merges paraphrase questions
 DECAY_HALF_LIFE_S = 60.0  # P-13: decay weight halves every minute without evidence
 EXPIRY_THRESHOLD = 0.15  # P-14: below this weight a pending question is retired
+
+# canticos-6ic: topics are context, not actions. A topic that recurs (2+
+# mentions) but has no question yet gets exactly one deterministic low-priority
+# candidate, so the topic -> question path survives without outranking anything
+# grounded.
+TOPIC_SYNTH_MENTIONS = 2
+TOPIC_SYNTH_PRIORITY = "low"
+TOPIC_SYNTH_SOURCE = "topic-synth"
 
 # canticos-47b: discovery slots are the learning goals of an interview type.
 # Weights feed the goal-gap rank term; keywords let an untagged question still
@@ -83,6 +95,13 @@ def normalize_topic(text):
     """Canonical dedupe key: lowercase, strip punctuation, collapse whitespace."""
     s = re.sub(r"[^a-z0-9\u00e0-\u00ff\s]", " ", (text or "").lower())
     return re.sub(r"\s+", " ", s).strip()
+
+
+def topic_question_text(name):
+    """Deterministic candidate wording for a recurring, question-less topic
+    (canticos-6ic). Same topic name -> same question text, so repeated ingests
+    never create a second key."""
+    return f"¿Qué puedes contarme sobre {name}?"
 
 
 def _stem_es(word):
@@ -447,8 +466,10 @@ class Queue:
             if not key:
                 continue
             prio = q.get("priority") if isinstance(q, dict) else "medium"
-            extra = ({k: q.get(k) for k in ("grounds", "evidence", "contract_miss")
+            extra = ({k: q.get(k) for k in ("grounds", "evidence", "contract_miss",
+                                             "source")
                       if q.get(k) is not None} if isinstance(q, dict) else {})
+            synthesized = extra.get("source") == TOPIC_SYNTH_SOURCE
             # canticos-47b: every question references a thread (explicit ref,
             # else its own normalized text) and, when slots are configured, the
             # goal it serves (explicit tag wins over keyword classification).
@@ -464,7 +485,7 @@ class Queue:
                 extra["goal_id"] = goal_id
             cur = self.questions.get(key)
             fuzzy = False
-            if cur is None:
+            if cur is None and not synthesized:
                 cur = self._match_pending(token_set(text))
                 fuzzy = cur is not None
             if fuzzy and thread_ref is None:
@@ -518,6 +539,55 @@ class Queue:
                 if PRIORITY_RANK.get(prio, 2) > PRIORITY_RANK.get(cur["priority"], 2):
                     cur["priority"] = prio
             cur["score"] = score_for(cur["priority"], cur["mentions"])
+        self._synthesize_topics(now)
+
+    def topic_question_count(self, key):
+        """Questions attached to a topic thread (canticos-6ic). Explicit thread
+        refs are the link; a question whose own text normalizes to the topic key
+        counts too. Terminal questions still count: the topic *has* a path to a
+        question, so no synthetic duplicate is needed."""
+        key = normalize_topic(key)
+        return sum(1 for q in self.questions.values()
+                   if normalize_topic(q.get("thread") or q["text"]) == key)
+
+    def has_question(self, key):
+        """True when the topic already has at least one question; drives the
+        strip's ✓ marker and blocks topic synthesis."""
+        return self.topic_question_count(key) > 0
+
+    def topic_entries(self):
+        """Strip-ready topic view (ranked, one dict per topic). The TUI renders
+        these as a single clipped context line; they are never action rows."""
+        with self._lock:
+            return [{"key": t["key"], "name": t["name"],
+                     "mentions": t["mentions"], "priority": t["priority"],
+                     "has_question": self.has_question(t["key"])}
+                    for t in self.ranked_topics()]
+
+    def _synthesize_topics(self, now=None):
+        """canticos-6ic topic-to-question path: a topic mentioned at least
+        TOPIC_SYNTH_MENTIONS times with no question yet yields exactly one
+        deterministic low-priority candidate. Sorted by topic key so repeated
+        ingests are deterministic; the candidate's explicit thread is the topic
+        key, which makes it count as that topic's question and blocks a second
+        synthesis."""
+        if not self.topics:
+            return
+        candidates = []
+        for t in sorted(self.topics.values(), key=lambda item: item["key"]):
+            if t["mentions"] < TOPIC_SYNTH_MENTIONS:
+                continue
+            if self.topic_question_count(t["key"]):
+                continue
+            candidates.append({
+                "text": topic_question_text(t["name"]),
+                "priority": TOPIC_SYNTH_PRIORITY,
+                "source": TOPIC_SYNTH_SOURCE,
+                "evidence": "no-evidence",
+                "thread": t["key"],
+            })
+        if candidates:
+            self._ingest(questions=candidates, now=now)
 
     def ranked_topics(self):
         with self._lock:
@@ -542,6 +612,7 @@ class Queue:
             gaps = self._goal_gaps(now)
             return sorted(self.questions.values(),
                           key=lambda q: (0 if q["status"] == "pending" else 1,
+                                         1 if q.get("source") == TOPIC_SYNTH_SOURCE else 0,
                                          -(q["score"] + gaps.get(q["key"], 0.0)),
                                          -q["last_seen"], q["text"]))
 
@@ -575,19 +646,23 @@ class Queue:
             q["shown"] = True
             return dict(q)
 
-    def _transition(self, key, status):
+    def _transition(self, key, status, **fields):
         """Set a lifecycle status; return a snapshot only when it changed, so
-        repeated calls never emit duplicate transition events."""
+        repeated calls never emit duplicate transition events. Extra fields
+        (canticos-8ax: a captured answer) ride on the same transition."""
         with self._lock:
             q = self.questions.get(key)
             if not q or q["status"] == status:
                 return None
             q["status"] = status
+            q.update(fields)
             return dict(q)
 
-    def mark_asked(self, key):
-        """Mark asked; returns the question snapshot when it transitioned."""
-        return self._transition(key, "asked")
+    def mark_asked(self, key, answer=None):
+        """Mark asked and store the optional one-line answer (canticos-8ax);
+        returns the question snapshot when it transitioned. A skipped answer is
+        stored as None so queue.json keeps a stable field."""
+        return self._transition(key, "asked", answer=answer)
 
     def mark_dismissed(self, key):
         """Dismiss (canticos-vvc): kept in the snapshot for the audit trail but

@@ -312,3 +312,86 @@ def test_snapshot_includes_threads_and_goals_only_when_configured():
     question = snap["questions"][0]
     assert question["thread"] == core.normalize_topic("¿Cuánto costó la multa?")
     assert question["goal_id"] == "cost"
+
+
+# ---------------------------------------------------------------------------
+# topics as context + topic-to-question synthesis (canticos-6ic)
+# ---------------------------------------------------------------------------
+
+def test_topic_with_one_mention_does_not_synthesize_a_question():
+    q = core.Queue()
+    q.ingest(topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1000.0)
+    assert q.pending_questions(now=1000.0) == []
+    assert q.topic_question_count("proveedor") == 0
+    assert not q.has_question("proveedor")
+
+
+def test_recurring_topic_synthesizes_one_deterministic_candidate():
+    q = core.Queue()
+    q.ingest(topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1000.0)
+    q.ingest(topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1100.0)
+    synth = [item for item in q.pending_questions(now=1100.0)
+             if item.get("source") == core.TOPIC_SYNTH_SOURCE]
+    assert len(synth) == 1
+    item = synth[0]
+    assert item["text"] == core.topic_question_text("Proveedor")
+    assert item["priority"] == "low"
+    assert item["evidence"] == "no-evidence"
+    assert item["thread"] == "proveedor"
+    assert q.topic_question_count("proveedor") == 1
+    assert q.has_question("proveedor") is True
+    # recurring evidence never creates a second candidate for the same topic
+    q.ingest(topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1200.0)
+    assert len([item for item in q.questions.values()
+                if item.get("source") == core.TOPIC_SYNTH_SOURCE]) == 1
+
+
+def test_existing_question_blocks_topic_synthesis():
+    q = core.Queue()
+    q.ingest(questions=[{"text": "Cuentame del problema del proveedor",
+                         "thread": "proveedor", "priority": "high"}],
+             topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1000.0)
+    q.ingest(topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1100.0)
+    assert q.topic_question_count("proveedor") == 1
+    assert not [item for item in q.questions.values()
+                if item.get("source") == core.TOPIC_SYNTH_SOURCE]
+
+
+def test_synth_candidate_never_outranks_grounded_questions():
+    q = core.Queue()
+    q.ingest(topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1000.0)
+    q.ingest(questions=[{"text": "pregunta anclada de prioridad baja",
+                         "priority": "low",
+                         "grounds": "texto del invitado",
+                         "evidence": "grounds"}],
+             topics=[{"name": "Proveedor", "priority": "high", "note": ""}],
+             now=1100.0)
+    pending = q.pending_questions(now=1100.0)
+    grounded = next(item for item in pending if item.get("evidence") == "grounds")
+    synth = next(item for item in pending
+                 if item.get("source") == core.TOPIC_SYNTH_SOURCE)
+    assert pending.index(grounded) < pending.index(synth)
+    # even a score bump cannot promote the synth above a grounded question
+    q.questions[synth["key"]]["score"] = 10_000.0
+    assert q.pending_questions(now=1100.0)[0]["key"] == grounded["key"]
+
+
+def test_snapshot_carries_asked_answer_and_none_when_skipped():
+    q = core.Queue()
+    q.ingest(questions=[{"text": "primera pregunta", "priority": "high"},
+                        {"text": "segunda pregunta", "priority": "high"}],
+             now=1000.0)
+    keys = [item["key"] for item in q.ranked_questions(now=1000.0)]
+    q.mark_asked(keys[0], answer="porque costaba demasiado")
+    q.mark_asked(keys[1])
+    snap = q.snapshot(now=1000.0)
+    by_key = {item["key"]: item for item in snap["questions"]}
+    assert by_key[keys[0]]["answer"] == "porque costaba demasiado"
+    assert by_key[keys[1]]["answer"] is None

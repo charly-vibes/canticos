@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 import interview_live_core as core  # noqa: E402
 import interview_live_tui as tui  # noqa: E402
@@ -78,8 +80,13 @@ def test_recurring_topic_outranks_oneoff_high():
     assert q.topics["slow burn"]["mentions"] == 3
     ranked = [t["name"] for t in q.ranked_topics()]
     assert ranked[0] == "slow-burn"
-    # questions keep arrival order unless a same-text question recurs
-    assert [it["text"] for it in q.ranked_questions()] == ["Qn1", "Qn2"]
+    # questions keep arrival order unless a same-text question recurs; the
+    # recurring question-less topic also adds its one synth candidate (6ic)
+    real = [it["text"] for it in q.ranked_questions()
+            if it.get("source") != core.TOPIC_SYNTH_SOURCE]
+    assert real == ["Qn1", "Qn2"]
+    assert any(it.get("source") == core.TOPIC_SYNTH_SOURCE
+               for it in q.pending_questions())
     # matched priority bump: topic seen as medium then low stays medium
     assert q.topics["slow burn"]["priority"] == "medium"
 
@@ -156,10 +163,10 @@ def _right_lines(lay):
     return "\n".join(line for _, line in lay["right"])
 
 
-def test_layout_three_zones_lead_backlog_topics():
-    """canticos-wrl: the pane is ASK NOW + backlog + topics, not one mixed
-    ranked list. The lead is the best pending question; the backlog holds the
-    following ones; topics render as before."""
+def test_layout_lead_backlog_and_topic_strip():
+    """canticos-wrl/canticos-6ic: the pane is ASK NOW + backlog + a single
+    context strip. The lead is the best pending question; the backlog holds
+    the following ones; topics never render as ranked action rows."""
     ui = make_ui()
     ui.queue.ingest(questions=[
         {"text": "Como elegiste a ese proveedor", "priority": "medium"},
@@ -176,9 +183,54 @@ def test_layout_three_zones_lead_backlog_topics():
     assert "Cuentame mas del problema del proveedor" in lead
     assert len(lay["backlog"]) == 5  # 6 pending -> lead + 5 following
     assert all(e["key"] != lay["lead"]["key"] for e in lay["backlog"])
-    assert "BACKLOG" in _right_lines(lay) and "TOPICS" in _right_lines(lay)
-    topics = "\n".join(t["line"] for t in lay["topics"])
-    assert "Proveedor" in topics and "x2" in topics
+    right = _right_lines(lay)
+    assert "BACKLOG" in right
+    assert "TOPICS" not in right, "ranked topics block must be gone"
+    assert "TEMAS:" in right
+    assert not any(kind == "topic" for kind, _ in lay["right"])
+    assert lay["topic_strip"] == next(line for kind, line in lay["right"]
+                                      if kind == "topic-strip")
+    assert "Proveedor" in lay["topic_strip"] and "x2" in lay["topic_strip"]
+    assert lay["topic_strip"].count("✓") == 1  # the synth candidate is its question
+    assert [(t["name"], t["mentions"], t["has_question"]) for t in lay["topics"]] == [
+        ("Proveedor", 2, True)]
+
+
+@pytest.mark.parametrize("width", [52, 80])
+def test_topic_context_strip_is_one_clipped_line(width):
+    """The strip is one line at every supported width; per-topic rows are gone
+    even when many topics compete for the pane."""
+    ui = make_ui()
+    ui.queue.ingest(topics=[{"name": "proveedor", "priority": "high", "note": ""}])
+    ui.queue.ingest(topics=[
+        {"name": "LA CAUSALIDAD TEMPORAL REVELADA (29:48)", "priority": "low", "note": ""},
+        {"name": "otro tema larguisimo que no cabe entero", "priority": "low", "note": ""},
+    ])
+    lay = tui.build_layout(ui, width, 24)
+    strip = lay["topic_strip"]
+    assert strip.startswith("TEMAS:")
+    assert len(strip) <= width
+    assert not any(kind == "topic" for kind, _ in lay["right"])
+    assert "TOPICS" not in _right_lines(lay)
+    assert sum(1 for kind, _ in lay["right"] if kind == "topic-strip") == 1
+    assert all(len(line) <= width for _, line in lay["right"])
+
+
+def test_topic_strip_check_marks_only_topics_with_a_question():
+    """✓ follows a topic that already has at least one question; a topic with
+    no question stays unmarked."""
+    ui = tui.TuiState()
+    ui.started = 100.0
+    ui.queue.ingest(topics=[{"name": "proveedor", "priority": "high", "note": ""},
+                            {"name": "precio", "priority": "medium", "note": ""}],
+                    now=100.0)
+    ui.queue.ingest(questions=[{"text": "Cuentame del proveedor",
+                                "thread": "proveedor", "priority": "high"}],
+                    now=101.0)
+    lay = tui.build_layout(ui, 200, 24, now=101.0)
+    assert "proveedor x1 ✓" in lay["topic_strip"]
+    assert "precio x1 ✓" not in lay["topic_strip"]
+    assert "proveedor x1" in lay["topic_strip"]
 
 
 def test_layout_truncates_every_zone_to_52_columns():
@@ -197,8 +249,8 @@ def test_layout_truncates_every_zone_to_52_columns():
         assert len(line) <= 52
     for entry in lay["backlog"]:
         assert len(entry["line"]) <= 52
-    for topic in lay["topics"]:
-        assert len(topic["line"]) <= 52
+    assert len(lay["topic_strip"]) <= 52
+    assert all("line" not in topic for topic in lay["topics"])
     for _, line in lay["right"]:
         assert len(line) <= 52
     assert lay["footer"]  # footer present even in a narrow terminal
@@ -479,3 +531,80 @@ def test_note_shown_expires_before_shown_emission():
     assert [e for e, _ in events] == ["question_dismissed"]
     assert events[0][1]["reason"] == "expired"
     assert ui.queue.questions[q["key"]]["shown"] is False
+
+
+# ---------------------------------------------------------------------------
+# answer capture on ask (canticos-8ax)
+# ---------------------------------------------------------------------------
+
+def _askable_ui():
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "Cuentame del problema del proveedor",
+                                "priority": "high"}])
+    return ui, events
+
+
+def test_ask_stores_answer_and_emits_it_in_question_asked():
+    ui, events = _askable_ui()
+    asked = ui.ask_selected(answer="fue una multa de 200 euros")
+    assert asked is not None
+    key = asked["key"]
+    assert ui.queue.questions[key]["answer"] == "fue una multa de 200 euros"
+    payload = next(p for e, p in events if e == "question_asked")
+    assert payload["key"] == key
+    assert payload["answer"] == "fue una multa de 200 euros"
+    snap = ui.queue.snapshot()
+    stored = next(q for q in snap["questions"] if q["key"] == key)
+    assert stored["answer"] == "fue una multa de 200 euros"
+
+
+def test_ask_without_answer_emits_none_and_skips_followup():
+    ui, events = _askable_ui()
+    calls = []
+    ui.followup = lambda question, answer: calls.append((question, answer))
+    assert ui.ask_selected() is not None
+    payload = next(p for e, p in events if e == "question_asked")
+    assert payload["answer"] is None
+    assert calls == []
+
+
+def test_ask_with_answer_prompts_and_calls_followup_once():
+    ui, events = _askable_ui()
+    calls = []
+    ui.answer_prompt = lambda: "me costo dos semanas"
+    ui.followup = lambda question, answer: calls.append((question, answer))
+    asked = ui.ask_selected()
+    assert asked["answer"] == "me costo dos semanas"
+    assert len(calls) == 1
+    question, answer = calls[0]
+    assert question["key"] == asked["key"] and answer == "me costo dos semanas"
+    assert [e for e, _ in events] == ["question_asked"]
+
+
+def test_whitespace_answer_counts_as_skip():
+    ui, _ = _askable_ui()
+    calls = []
+    ui.followup = lambda question, answer: calls.append((question, answer))
+    ui.ask_selected(answer="   ")
+    assert calls == []
+
+
+def test_followup_hook_failure_is_logged_never_raised():
+    ui, events = _askable_ui()
+
+    def boom(question, answer):
+        raise RuntimeError("model exploded")
+
+    ui.followup = boom
+    asked = ui.ask_selected(answer="una respuesta")
+    assert asked is not None
+    assert ui.queue.questions[asked["key"]]["status"] == "asked"
+    errors = [p for e, p in events if e == "followup_error"]
+    assert len(errors) == 1 and "model exploded" in errors[0]["reason"]
+
+
+def test_plain_mode_ask_never_waits_on_a_prompt():
+    """No curses: answer_prompt stays None, ask is immediate and answer None."""
+    ui, _ = _askable_ui()
+    assert ui.answer_prompt is None
+    assert ui.ask_selected() is not None

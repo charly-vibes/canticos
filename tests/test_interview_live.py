@@ -821,8 +821,13 @@ def test_queue_logic_unit(capsys):
     assert q.topics["slow burn"]["mentions"] == 3
     ranked = [t["name"] for t in q.ranked_topics()]
     assert ranked[0] == "slow-burn"
-    # questions preserved in arrival order (no topic dedupe interference)
-    assert [it["text"] for it in q.ranked_questions()] == ["Qn1", "Qn2"]
+    # questions preserved in arrival order (no topic dedupe interference);
+    # the recurring question-less topic adds its one synth candidate (6ic)
+    real = [it["text"] for it in q.ranked_questions()
+            if it.get("source") != core.TOPIC_SYNTH_SOURCE]
+    assert real == ["Qn1", "Qn2"]
+    assert any(it.get("source") == core.TOPIC_SYNTH_SOURCE
+               for it in q.pending_questions())
 
 
 def test_participants_validation(env):
@@ -1491,3 +1496,113 @@ def test_live_session_injects_goals_and_writes_threads(env):
     assert [g["id"] for g in data["goals"]] == [s["id"] for s in core.MOM_TEST_SLOTS]
     assert data["threads"]
     assert all(item["thread"] for item in data["questions"])
+
+
+# -- answer capture + answer-driven follow-ups (canticos-8ax) -----------------
+
+def test_followup_cmd_carries_answer_and_validates_through_validate_round():
+    cmd = sug.followup_cmd("Cuentame del proveedor", "fue una multa de 200 euros",
+                           participants=3, pi_model="weak/model",
+                           question_model="strong/model")
+    assert cmd[:2] == ["pi", "--print"]
+    assert "--system-prompt" in cmd
+    assert cmd[cmd.index("--model") + 1] == "strong/model"
+    prompt = cmd[-1]
+    assert "Cuentame del proveedor" in prompt
+    assert "fue una multa de 200 euros" in prompt
+    assert "ONE follow-up" in prompt
+    out = json.dumps({"questions": [{"text": "¿Cuánto te costó esa multa?",
+                                      "priority": "high"}], "topics": []})
+    accepted, rejected, reasons = sug.validate_followup(out, [])
+    assert rejected == []
+    assert accepted[0]["text"] == "¿Cuánto te costó esa multa?"
+    assert accepted[0]["evidence"] == "no-evidence"
+    assert sug.REASON_NO_EVIDENCE in reasons
+
+
+def test_generate_followup_uses_validate_round_and_ingests_one_candidate(env, monkeypatch):
+    rec = Path(env["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    mod = load_cli_module()
+    tool = mod.InterviewLive(mod.parse_args(
+        ["--from", str(rec), "--session", "followup-gate",
+         "--out", env["INTERVIEW_DIR"]]))
+    calls, seen = [], []
+    real_validate = sug.validate_round
+
+    def spy(questions, topics=None, window_lines=None):
+        calls.append((list(questions), topics))
+        return real_validate(questions, topics, window_lines)
+
+    monkeypatch.setattr(sug, "validate_round", spy)
+    payload = json.dumps({"questions": [
+        {"text": "Q-F: ¿Cuánto te costó esa multa?", "priority": "high"}],
+        "topics": []})
+
+    def fake_pi(cmd, timeout):
+        seen.append(cmd)
+        return payload, None
+
+    monkeypatch.setattr(tool, "_run_pi", fake_pi)
+    question = {"key": "proveedor", "text": "Cuentame del proveedor",
+                "thread": "proveedor", "priority": "high", "score": 100}
+    candidate = tool.generate_followup(question, "fue una multa de 200 euros")
+    events = session_events(env, "followup-gate")
+    tool.log.close()
+
+    assert calls, "follow-up bypassed the shared validation gate"
+    assert len(seen) == 1
+    assert "fue una multa de 200 euros" in seen[0][-1]
+    assert candidate["source"] == "followup"
+    assert candidate["thread"] == "proveedor"
+    assert candidate["text"] == "Q-F: ¿Cuánto te costó esa multa?"
+    assert tool.queue.pending_questions()
+    assert any(e["type"] == "followup_result" for e in events)
+    assert not [e for e in events if e["type"] == "followup_error"]
+
+
+def test_answerless_ask_never_enqueues_a_followup(env, monkeypatch):
+    rec = Path(env["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    mod = load_cli_module()
+    import interview_live_tui as tui
+
+    tool = mod.InterviewLive(mod.parse_args(
+        ["--from", str(rec), "--session", "followup-skip",
+         "--out", env["INTERVIEW_DIR"]]))
+    tool.ui = tui.TuiState(queue=tool.queue, emit=tool.log.emit)
+    tool.ui.followup = tool.enqueue_followup
+    started = []
+    monkeypatch.setattr(tool, "generate_followup",
+                        lambda question, answer: started.append((question, answer)))
+    tool.queue.ingest(questions=[{"text": "pregunta sin respuesta", "priority": "high"}],
+                      now=time.time())
+    tool.ui.ask_selected()  # Esc/empty path: no answer prompt wired, no wait
+    assert tool._suggest_q.empty()
+    assert started == []
+
+    tool.queue.ingest(questions=[{"text": "pregunta con respuesta", "priority": "high"}],
+                      now=time.time())
+    tool.ui.ask_selected(answer="porque era urgente")
+    job = tool._suggest_q.get_nowait()
+    assert job["kind"] == "followup"
+    assert job["answer"] == "porque era urgente"
+    assert started == [], "follow-up generation must not block the ask"
+    tool.log.close()
+
+
+def test_followup_failure_is_logged_not_raised(env, monkeypatch):
+    rec = Path(env["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    mod = load_cli_module()
+    tool = mod.InterviewLive(mod.parse_args(
+        ["--from", str(rec), "--session", "followup-fail",
+         "--out", env["INTERVIEW_DIR"]]))
+    monkeypatch.setattr(tool, "_run_pi", lambda cmd, timeout: (None, "timeout"))
+    candidate = tool.generate_followup(
+        {"key": "k", "text": "Cuentame", "thread": "k"}, "una respuesta")
+    events = session_events(env, "followup-fail")
+    tool.log.close()
+    assert candidate is None
+    errors = [e for e in events if e["type"] == "followup_error"]
+    assert errors and errors[0]["reason"] == "timeout"

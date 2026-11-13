@@ -165,6 +165,43 @@ def validate_round(questions, topics=None, window_lines=None):
     return accepted, rejected, list(dict.fromkeys(reasons))
 
 
+def followup_cmd(question, answer, participants=2, pi_model=None,
+                 question_model=None):
+    """pi argv for ONE answer-driven follow-up candidate (canticos-8ax).
+
+    Reuses the Mom Test system contract and the same JSON output shape as a
+    normal suggestion round, so the answer path feeds `validate_round` instead
+    of inventing a second questioner contract. `question_model` wins for this
+    call, mirroring `build_pi_cmd`."""
+    contract = system_prompt(participants) + (
+        "\n\nANSWER CAPTURE: the interviewer already asked one question and the "
+        "guest answered. Return exactly ONE follow-up question in the same JSON "
+        'object shape: {"questions": [{"text", "priority", "grounds", '
+        '"goal_id"}], "topics": []}. The question must deepen the answer, never '
+        "restate it.")
+    prompt = (
+        "QUESTION ALREADY ASKED:\n"
+        f"{question}\n\n"
+        "GUEST ANSWER:\n"
+        f"{answer}\n\n"
+        "Return ONE follow-up question as the JSON object described in the "
+        "system prompt. No commentary.")
+    cmd = ["pi", "--print", "--system-prompt", contract]
+    model = question_model or pi_model
+    if model:
+        cmd += ["--model", model]
+    cmd += [prompt]
+    return cmd
+
+
+def validate_followup(output, window_lines=None):
+    """Parse one answer-driven model reply and run it through the shared
+    `validate_round` gate (canticos-8ax). Returns (accepted, rejected,
+    reasons); the coordinator keeps at most the first accepted question."""
+    questions, topics = core.parse_suggestion_output(output)
+    return validate_round(questions, topics, window_lines)
+
+
 def digest_lines(pending, now=None, limit=DIGEST_LIMIT):
     """Pending-question digest with freshness/expiry awareness: the strongest
     entries that are still alive, each carrying its decay weight, age, and time

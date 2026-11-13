@@ -4,13 +4,18 @@ Responsibilities:
   - Ask how many participants are in the conversation at session start
   - Render a live transcript pane plus a three-zone NEXT pane: an ASK NOW lead
     card (best pending question + grounds quote + [MM:SS]), a compact backlog of
-    the following pending questions with j/k selection, and the topics strip
+    the following pending questions with j/k selection, and a single clipped
+    TEMAS context strip (topics are state, never action rows; canticos-6ic)
   - Keep the lead card stable: minimum dwell 8 s and only swap for a challenger
     scoring HYSTERESIS above the current card (pure function of ui state + now)
   - Keys: q quit, a/space ask selected, d dismiss selected, j/k select,
     f ask now, PgUp/PgDn scroll the transcript
+  - Asking captures an optional one-line answer in the footer (Esc/empty skips;
+    no prompt at all in plain mode) and hands it to an injected non-blocking
+    follow-up hook (canticos-8ax)
   - Emit question lifecycle events (question_shown / question_asked /
-    question_dismissed) through an injectable sink (canticos-vvc)
+    question_dismissed) through an injectable sink (canticos-vvc); the asked
+    payload carries `answer` (None when skipped)
 Rationale: canticos-c02 — an interviewing copilot is a dashboard you glance at,
   not a form you fill. canticos-wrl — one mixed ranked backlog forced a
   space-press every ~8.5 s in the baseline session; the NEXT card turns the
@@ -94,6 +99,12 @@ class TuiState:
         self.lead_key = None
         self.lead_since = None
         self.selection = 0
+        # canticos-8ax: asking captures an optional one-line answer. The prompt
+        # callback is wired only by the curses dashboard (None in plain/unit
+        # mode, so asking never blocks on a terminal read); the follow-up hook
+        # is the coordinator's non-blocking enqueue.
+        self.answer_prompt = None
+        self.followup = None
 
     def expire_stale(self, now=None):
         """Retire stale pending questions (canticos-q9j) and emit one
@@ -112,11 +123,23 @@ class TuiState:
         if shown:
             emit_question(self.emit, "question_shown", shown)
 
-    def mark_asked(self, key):
-        """Ask transition: queue status plus the question_asked event."""
-        q = self.queue.mark_asked(key)
+    def mark_asked(self, key, answer=None):
+        """Ask transition: queue status plus the question_asked event. The
+        optional one-line answer (canticos-8ax) is stored on the question and
+        carried in the event payload as `answer` (None when skipped). A
+        non-empty answer queues ONE follow-up through the injected hook; the
+        hook only enqueues work, so the dashboard never waits on the model."""
+        q = self.queue.mark_asked(key, answer=answer)
         if q:
-            emit_question(self.emit, "question_asked", q)
+            emit_question(self.emit, "question_asked", q, answer=q.get("answer"))
+            if answer and str(answer).strip() and self.followup is not None:
+                try:
+                    self.followup(q, answer)
+                except Exception as e:  # noqa: BLE001 — a bad hook never crashes the TUI
+                    try:
+                        self.emit("followup_error", reason=f"{type(e).__name__}: {e}")
+                    except Exception:  # noqa: BLE001 — emit may be closing
+                        pass
         return q
 
     def mark_dismissed(self, key):
@@ -202,12 +225,16 @@ class TuiState:
         self.selection = min(max(0, self.selection + delta), len(selectable) - 1)
         return self.selection
 
-    def ask_selected(self):
-        """Ask the selected backlog question (a/space). Empty backlog -> None."""
+    def ask_selected(self, answer=None):
+        """Ask the selected question (a/space). In the curses dashboard a wired
+        answer_prompt opens the optional one-line footer input; plain/unit mode
+        leaves it None and skips straight to the ask. Empty backlog -> None."""
         q = self.selected_question()
         if not q:
             return None
-        asked = self.mark_asked(q["key"])
+        if answer is None and self.answer_prompt is not None:
+            answer = self.answer_prompt()
+        asked = self.mark_asked(q["key"], answer=answer)
         self.clamp_selection()
         return asked
 
@@ -236,6 +263,23 @@ def _prio_mark(priority):
     return "*" if priority == "high" else ("+" if priority == "medium" else "-")
 
 
+TOPIC_STRIP_PREFIX = "TEMAS: "
+TOPIC_HAS_QUESTION = "✓"
+
+
+def topic_strip_line(topics, width):
+    """canticos-6ic: topics are one clipped context line, never action rows.
+    Format: `TEMAS: name x2 + name x3 ✓`; ✓ marks a topic that already has at
+    least one question. Clip is the final width authority."""
+    parts = []
+    for t in topics:
+        part = f"{t['name']} x{t['mentions']}"
+        if t.get("has_question"):
+            part += f" {TOPIC_HAS_QUESTION}"
+        parts.append(part)
+    return _clip(TOPIC_STRIP_PREFIX + " + ".join(parts), width)
+
+
 def _lead_stamp(ui, q):
     """[MM:SS] arrival timestamp of the question relative to session start."""
     return fmt_mmss((q.get("added_at", ui.started) - ui.started) * 1000)
@@ -244,11 +288,13 @@ def _lead_stamp(ui, q):
 def build_layout(ui, width, height, scroll=0, now=None):
     """No curses and no direct I/O — unit-testable.
 
-    Returns header / transcript / lead / backlog / topics / footer zones plus
-    the transcript scroll position and backlog selection. The right pane is the
-    canticos-wrl three-zone NEXT card: ASK NOW (one stable lead question with
-    its grounds quote and [MM:SS]), BACKLOG (the following pending questions
-    with a j/k selection index) and TOPICS (unchanged rendering).
+    Returns header / transcript / lead / backlog / topics / topic_strip /
+    footer zones plus the transcript scroll position and backlog selection. The
+    right pane is the canticos-wrl three-zone NEXT card: ASK NOW (one stable
+    lead question with its grounds quote and [MM:SS]), BACKLOG (the following
+    pending questions with a j/k selection index) and, after canticos-6ic, a
+    single clipped TEMAS context strip instead of a ranked topics block. Topics
+    stay in `topics` as internal state (name/mentions/has_question).
 
     Side effects, both through ui.emit (no-op by default): stale pending
     questions are expired (question_dismissed with reason='expired',
@@ -324,12 +370,8 @@ def build_layout(ui, width, height, scroll=0, now=None):
                         "score": q["score"], "status": q["status"], "line": text})
         shown_qs.append(q)
 
-    topics = []
-    for t in ui.queue.ranked_topics():
-        topics.append({"name": t["name"], "mentions": t["mentions"],
-                       "priority": t["priority"],
-                       "line": _clip(f"{_prio_mark(t['priority'])} {t['name']} "
-                                     f"x{t['mentions']}", width)})
+    topics = ui.queue.topic_entries()
+    topic_strip = topic_strip_line(topics, width) if topics else ""
 
     right = [("lead" if i == 0 else "card", line)
              for i, line in enumerate(lead_zone["lines"])]
@@ -337,9 +379,8 @@ def build_layout(ui, width, height, scroll=0, now=None):
         right.append(("title", "BACKLOG"))
         right.extend(("selected" if e["selected"] else "backlog", e["line"])
                      for e in backlog)
-    if topics:
-        right.append(("title", "TOPICS"))
-        right.extend(("topic", t["line"]) for t in topics)
+    if topic_strip:
+        right.append(("topic-strip", topic_strip))
     right = right[:max(0, main_h - 1)]
 
     # The lead card and the visible backlog rows are exactly the rendered
@@ -361,6 +402,7 @@ def build_layout(ui, width, height, scroll=0, now=None):
         "lead": lead_zone,
         "backlog": backlog,
         "topics": topics,
+        "topic_strip": topic_strip,
         "right": right,
         "selection": ui.selection,
         "footer": footer,
@@ -441,6 +483,50 @@ def prompt_participants(stdscr, default):
     return int(buf) if buf.isdigit() else default
 
 
+def prompt_answer(stdscr):
+    """Optional one-line answer in the footer after an ask (canticos-8ax).
+    Enter accepts; Esc or an empty line skips (returns None). Only the curses
+    dashboard calls this, so plain/unit mode never waits on a read."""
+    if curses is None:  # pragma: no cover - curses dashboard only
+        return None
+    h, w = stdscr.getmaxyx()
+    buf = ""
+    try:
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        stdscr.timeout(-1)
+        while True:
+            label = "ANSWER (optional; Enter saves, Esc/empty skips): " + buf
+            try:
+                stdscr.addnstr(h - 1, 0, _clip(label, w), w, curses.color_pair(4))
+                stdscr.refresh()
+                ch = stdscr.getch()
+            except curses.error:
+                break
+            if ch in (ord("\n"), ord("\r"), getattr(curses, "KEY_ENTER", -1)):
+                break
+            if ch in (27, 3):  # Esc / ^C -> skip
+                buf = ""
+                break
+            if ch in (getattr(curses, "KEY_BACKSPACE", -1), 127, 8):
+                buf = buf[:-1]
+            elif 32 <= ch <= 126 or 160 <= ch <= 255:
+                buf += chr(ch)
+    finally:
+        try:
+            stdscr.timeout(200)
+        except curses.error:
+            pass
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+    answer = " ".join(buf.split())
+    return answer or None
+
+
 def draw(stdscr, layout):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -469,8 +555,8 @@ def draw(stdscr, layout):
                     pair = curses.color_pair(5) | curses.A_BOLD
                 elif kind == "selected":
                     pair = curses.color_pair(5) | curses.A_BOLD
-                elif kind == "topic":
-                    pair = curses.color_pair(1)  # topics unchanged (canticos-6ic)
+                elif kind == "topic-strip":
+                    pair = curses.color_pair(6)  # context, not an action
                 elif kind == "card" and layout["lead"]["priority"] == "high":
                     pair = curses.color_pair(5)
                 else:
@@ -518,18 +604,22 @@ def run_dashboard(stdscr, ui, participants_default, stop_check=lambda: False):
     _use_colors()
     ui.participants = prompt_participants(stdscr, participants_default)
     stdscr.timeout(200)
+    ui.answer_prompt = lambda: prompt_answer(stdscr)
     scroll = 0
-    while not stop_check():
-        try:
-            ch = stdscr.getch()
-        except curses.error:
-            ch = -1
-        if ch in (ord("q"), 3):
-            break
-        scroll = handle_key(ui, ch, scroll)
-        h, w = stdscr.getmaxyx()
-        layout = build_layout(ui, w, h, scroll=scroll)
-        draw(stdscr, layout)
+    try:
+        while not stop_check():
+            try:
+                ch = stdscr.getch()
+            except curses.error:
+                ch = -1
+            if ch in (ord("q"), 3):
+                break
+            scroll = handle_key(ui, ch, scroll)
+            h, w = stdscr.getmaxyx()
+            layout = build_layout(ui, w, h, scroll=scroll)
+            draw(stdscr, layout)
+    finally:
+        ui.answer_prompt = None
     return scroll
 
 
