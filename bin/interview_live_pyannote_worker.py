@@ -22,8 +22,10 @@ def main():
         "pyannote/speaker-diarization-3.1",
         token=os.environ.get("HF_TOKEN") or True,
     )
-    dia = pipeline(wav)
-    for turn, _, label in dia.itertracks(yield_label=True):
+    result = pipeline(wav)
+    # pyannote >=4 wraps the Annotation in DiarizeOutput; v3 returned it raw
+    ann = getattr(result, "speaker_diarization", result)
+    for turn, _, label in ann.itertracks(yield_label=True):
         sys.stdout.write(
             f"SPEAKER {wav} 1 {turn.start:.3f} {turn.duration:.3f} <NA> <NA> {label} <NA>\n")
     return 0
