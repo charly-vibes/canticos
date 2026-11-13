@@ -4,11 +4,13 @@ Responsibilities:
   - Parse pi suggestion output (JSON or legacy plain lines) into questions/topics
   - Maintain a prioritized queue: topics dedupe by normalized name and accumulate
     mention counts (recurrence raises priority); questions dedupe by normalized
-    text with pending/asked status
+    text and merge paraphrases of the same pending question by token overlap
   - Rank items so the dashboard shows "what matters right now" first
 Rationale: canticos-c02 — the reactive TUI needs a small, unit-testable model
   decoupled from ffmpeg/whisper/pi subprocesses and from curses rendering. Tests
   import this module directly; the script and the TUI both share this one queue.
+  canticos-4pi — exact-key dedupe fragmented the queue under paraphrase storms;
+  token-set Jaccard (after a light es normalization) folds variants together.
 """
 
 import json
@@ -19,6 +21,21 @@ import time
 PRIORITY_BASE = {"high": 100, "medium": 60, "low": 30}
 PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
 RECURRENCE_BONUS = 40  # added per extra mention beyond the first
+JACCARD_MERGE = 0.7  # token-set overlap at/above this merges paraphrase questions
+
+# Vowel accents only: folding these makes "cuánto"/"cuanto" meet without
+# erasing ñ (año != ano) or any consonant distinction.
+_ACCENT_FOLD = str.maketrans("áéíóúü", "aeiouu")
+
+# Function words carry no question meaning; paraphrase variants differ mostly
+# by these ("la multa" vs "esa multa"), so they are excluded from overlap.
+_ES_STOPWORDS = frozenset({
+    "el", "la", "los", "las", "lo", "un", "una", "unos", "unas",
+    "de", "del", "al", "a", "en", "por", "para", "con", "sin", "sobre", "entre",
+    "y", "e", "o", "u", "que", "le", "les", "se", "su", "sus",
+    "mi", "mis", "tu", "tus", "este", "esta", "estos", "estas",
+    "ese", "esa", "esos", "esas", "esto", "eso", "es", "son", "ser",
+})
 
 
 def fmt_ms(ms):
@@ -31,6 +48,41 @@ def normalize_topic(text):
     """Canonical dedupe key: lowercase, strip punctuation, collapse whitespace."""
     s = re.sub(r"[^a-z0-9\u00e0-\u00ff\s]", " ", (text or "").lower())
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _stem_es(word):
+    """Conservative Spanish suffix strip: plural -s, then feminine/masculine
+    final -a/-o on longer words. Short words and consonants stay intact."""
+    if len(word) > 3 and word.endswith("s"):
+        word = word[:-1]
+    if len(word) > 4 and word[-1] in "ao":
+        word = word[:-1]
+    return word
+
+
+def token_set(text):
+    """Content tokens used for paraphrase similarity. Deliberately separate from
+    normalize_topic: keys stay exact so stored identity and lookups don't shift."""
+    tokens = set()
+    for word in normalize_topic(text).translate(_ACCENT_FOLD).split():
+        if word in _ES_STOPWORDS:
+            continue
+        stem = _stem_es(word)
+        if stem:
+            tokens.add(stem)
+    return frozenset(tokens)
+
+
+def _jaccard_sets(a, b):
+    """Jaccard overlap of two token sets; 0 when either side is empty."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def jaccard_score(text_a, text_b):
+    """Token-set Jaccard overlap in [0, 1]; 0 when either side has no content."""
+    return _jaccard_sets(token_set(text_a), token_set(text_b))
 
 
 def speaker_label(spk, names):
@@ -106,7 +158,8 @@ def parse_suggestion_output(text):
 class Queue:
     """Prioritized suggestion queue shared by the worker loop, the suggestion
     thread, and the TUI. RLock-guarded: ingest happens off-thread while the
-    dashboard iterates ranked views."""
+    dashboard iterates ranked views. A new question whose content tokens overlap
+    a pending item's by >= JACCARD_MERGE folds into it instead of adding a key."""
 
     def __init__(self):
         self.topics = {}     # normalized key -> topic dict
@@ -117,6 +170,18 @@ class Queue:
         with self._lock:
             self._ingest(questions, topics, now)
 
+    def _match_pending(self, tokens):
+        """Best pending question whose token set overlaps tokens above threshold.
+        Dict order breaks ties, so repeated ingests stay deterministic."""
+        best, best_score = None, 0.0
+        for q in self.questions.values():
+            if q.get("status") != "pending":
+                continue
+            score = _jaccard_sets(tokens, token_set(q["text"]))
+            if score >= JACCARD_MERGE and score > best_score:
+                best, best_score = q, score
+        return best
+
     def _ingest(self, questions=None, topics=None, now=None):
         now = now if now is not None else time.time()
         for q in questions or []:
@@ -126,6 +191,10 @@ class Queue:
                 continue
             prio = q.get("priority") if isinstance(q, dict) else "medium"
             cur = self.questions.get(key)
+            fuzzy = False
+            if cur is None:
+                cur = self._match_pending(token_set(text))
+                fuzzy = cur is not None
             if cur is None:
                 cur = {"key": key, "text": text, "priority": prio,
                        "mentions": 1, "added_at": now, "last_seen": now,
@@ -134,6 +203,9 @@ class Queue:
             else:
                 cur["mentions"] += 1
                 cur["last_seen"] = now
+                if fuzzy:
+                    # paraphrase: show the newest wording, keep the original key
+                    cur["text"] = text
                 if PRIORITY_RANK.get(prio, 2) > PRIORITY_RANK.get(cur["priority"], 2):
                     cur["priority"] = prio
             cur["score"] = score_for(cur["priority"], cur["mentions"])
