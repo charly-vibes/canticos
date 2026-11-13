@@ -19,6 +19,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 import interview_live_core as core  # noqa: E402
+import interview_live_diarize as dia  # noqa: E402
 import interview_live_events as evlog  # noqa: E402
 import interview_live_suggest as sug  # noqa: E402
 import interview_live_whisper as wh  # noqa: E402
@@ -382,6 +383,126 @@ def test_adopt_clean_root_is_noop(env):
     assert "nothing to adopt" in r.stdout.lower()
     r2 = run(env, "--adopt", "--json")
     assert r2.returncode == 2  # --json stays list-only
+
+
+def test_parse_rttm_basic_and_malformed():
+    """canticos-q73: RTTM lines -> (start_ms, end_ms, label); junk skipped."""
+    rttm = (
+        "SPEAKER cap 1 0.500 2.250 <NA> <NA> SPEAKER_00 <NA>\n"
+        "SPEAKER cap 1 3.000 1.000 <NA> <NA> SPEAKER_01 <NA>\n"
+        "junk line\n"
+        "SPEAKER cap 1 bad float 1.0 <NA> <NA> SPEAKER_02 <NA>\n"
+        "SPEAKER cap 1 5.000 -1.0 <NA> <NA> SPEAKER_03 <NA>\n"
+    )
+    turns = dia.parse_rttm(rttm)
+    assert turns == [(500, 2750, "SPEAKER_00"), (3000, 4000, "SPEAKER_01")]
+
+
+def test_assign_turn_speakers_overlap_and_first_appearance():
+    """canticos-q73: lines re-attributed by max overlap; labels become ints in
+    first-appearance order; no-overlap lines keep their original id."""
+    lines = [
+        "[00:00:01] (speaker 0) uno",
+        "[00:00:04] (speaker 1) dos",
+        "[00:00:06] (speaker 0) tres",
+        "[00:01:00] (speaker 0) sin turnos",
+    ]
+    turns = [
+        (500, 2500, "SPEAKER_07"),   # covers line 1
+        (3500, 5500, "SPEAKER_02"),  # covers line 2
+        (5500, 7000, "SPEAKER_07"),  # covers line 3 (same voice returns)
+    ]
+    out, ids = dia.assign_turn_speakers(lines, turns)
+    assert ids == {"SPEAKER_07": 0, "SPEAKER_02": 1}
+    assert out[0] == "[00:00:01] (speaker 0) uno"
+    assert out[1] == "[00:00:04] (speaker 1) dos"
+    assert out[2] == "[00:00:06] (speaker 0) tres"
+    assert out[3] == "[00:01:00] (speaker 0) sin turnos"  # no turn: untouched
+
+
+def test_assign_turn_speakers_max_overlap_wins():
+    """canticos-q73: a line between two turns lands on the bigger overlap."""
+    lines = ["[00:00:05] (speaker 1) frontera"]
+    turns = [(3000, 5000, "A"), (5200, 8000, "B")]
+    out, _ = dia.assign_turn_speakers(lines, turns)
+    # 1s probe starting at 5s: overlap 0 with A (ends 5.0), ~0.8s with B
+    assert out[0] == "[00:00:05] (speaker 1) frontera"
+
+
+def test_placeholder_speakers_preserves_named():
+    """canticos-q73: diarized ids get placeholder names; user-named ids win."""
+    out = dia.placeholder_speakers({"SPEAKER_09": 1, "SPEAKER_00": 0},
+                                   existing_names={"1": {"name": "Ana"}})
+    assert out == {"0": {"name": "Speaker 0"}, "1": {"name": "Ana"}}
+
+
+UV_FAKE = """#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+with open(os.environ['UV_LOG'], 'a') as fh:
+    fh.write(' '.join(sys.argv[1:]) + '\\n')
+rttm = os.environ.get('UV_RTTM', '')
+sys.stdout.write(rttm)
+if os.environ.get('UV_ERR'):
+    sys.stderr.write(os.environ['UV_ERR'])
+sys.exit(int(os.environ.get('UV_FAIL', '0')))
+"""
+
+
+def test_diarize_session_rewrites_transcript(env):
+    """canticos-q73 e2e: --session X --diarize runs the pyannote worker (via
+    uv), re-attributes transcript lines by overlap, writes speakers.json
+    placeholders, and logs diarize events."""
+    import subprocess as sp
+    bins = Path(env["PATH"].split(":")[0])
+    uv = bins / "uv"
+    uv.write_text(UV_FAKE)
+    uv.chmod(0o755)
+    root = Path(env["INTERVIEW_DIR"])
+    d = root / "sess"
+    d.mkdir(parents=True)
+    (d / "capture.wav").write_bytes(b"RIFF")
+    (d / "transcript.txt").write_text(
+        "[00:00:01] (speaker 0) hola a los dos\n"
+        "[00:00:04] (speaker 1) hola\n"
+        "[00:00:06] (speaker 0) y como seguimos\n")
+    env2 = {**env,
+            "UV_LOG": str(root / "uv.jsonl"),
+            "UV_RTTM": "SPEAKER cap 1 0.500 2.000 <NA> <NA> SPEAKER_00 <NA>\n"
+                       "SPEAKER cap 1 3.500 1.500 <NA> <NA> SPEAKER_07 <NA>\n"
+                       "SPEAKER cap 1 5.500 2.000 <NA> <NA> SPEAKER_00 <NA>\n"}
+    r = sp.run([str(BIN), "--session", "sess", "--diarize"], env=env2,
+               capture_output=True, text=True, timeout=40)
+    assert r.returncode == 0, r.stderr
+    txt = (d / "transcript.txt").read_text()
+    assert "[00:00:01] (speaker 0) hola a los dos" in txt
+    assert "[00:00:04] (speaker 1) hola" in txt
+    assert "[00:00:06] (speaker 0) y como seguimos" in txt
+    assert "speaker 2" not in txt
+    spk = json.loads((d / "speakers.json").read_text())
+    assert spk["0"]["name"] == "Speaker 0" and spk["1"]["name"] == "Speaker 1"
+    uv_calls = (root / "uv.jsonl").read_text()
+    assert "pyannote.audio" in uv_calls and "capture.wav" in uv_calls
+    events = [json.loads(l) for l in (d / "events.jsonl").read_text().splitlines()]
+    assert any(e["type"] == "diarize_done" and e["speakers"] == 2 for e in events)
+    r2 = sp.run([str(BIN), "--session", "sess", "--diarize"],
+                env={**env2, "UV_FAIL": "1",
+                     "UV_ERR": "GatedRepoError: 403 not in the authorized list\n"},
+                capture_output=True, text=True, timeout=40)
+    assert r2.returncode == 1 and "diarization failed" in r2.stderr.lower()
+    assert "GatedRepoError" in r2.stderr  # the reason is surfaced, not swallowed
+
+
+def test_diarize_requires_session_and_recording(env):
+    """canticos-q73: --diarize without --session is a usage error; without
+    capture.wav it fails cleanly."""
+    r = run(env, "--diarize")
+    assert r.returncode == 2 and "--session" in r.stderr
+    root = Path(env["INTERVIEW_DIR"])
+    d = root / "sess"
+    d.mkdir(parents=True)
+    r2 = run(env, "--session", "sess", "--diarize")
+    assert r2.returncode == 1 and "capture.wav" in r2.stderr
 
 
 def test_default_language_is_spanish(env):

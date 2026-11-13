@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import interview_live_capture as cap  # noqa: E402
 import interview_live_core as core  # noqa: E402
+import interview_live_diarize as dia  # noqa: E402
 import interview_live_events as evlog  # noqa: E402
 import interview_live_suggest as sug  # noqa: E402
 import interview_live_tui as tui  # noqa: E402
@@ -410,6 +411,8 @@ def parse_args(argv):
                    help="Post-hoc tagging: rewrite an existing session's transcript labels (requires --session). No re-transcription.")
     p.add_argument("--adopt", action="store_true",
                    help="One-time migration: move legacy flat artifacts (capture.wav, transcript.txt, …) from the --out root into an adopt-<ts> session dir so --list shows them")
+    p.add_argument("--diarize", action="store_true",
+                   help="Re-diarize the session's capture.wav with pyannote (N speakers; requires --session, HF_TOKEN; first run downloads ~2GB torch) and re-attribute transcript lines by timestamp overlap")
     p.add_argument("--list", action="store_true",
                    help="List sessions under --out newest-first (name, date, duration, recording, transcript lines, questions) and exit")
     p.add_argument("--json", action="store_true",
@@ -428,6 +431,10 @@ def parse_args(argv):
         p.error("--session must be a filesystem-safe name (no slashes, no '..')")
     if args.json and not args.list:
         p.error("--json requires --list")
+    if args.diarize and not args.session:
+        p.error("--diarize requires --session NAME")
+    if args.diarize and (args.set_speaker or args.list or args.adopt):
+        p.error("--diarize cannot be combined with --set-speaker/--list/--adopt")
     if args.speaker:
         args.speaker = parse_speaker_specs(p, args.speaker)
     if args.set_speaker:
@@ -488,6 +495,71 @@ def cmd_set_speaker(work, specs):
 
 SESSION_ARTIFACTS = ("events.jsonl", "transcript.txt", "capture.wav",
                      "questions.md", "queue.json", "speakers.json", "ffmpeg.log")
+
+
+def load_speakers_names(spk_path):
+    """speakers.json -> {str_id: {"name"}}; corrupt/absent file -> {}."""
+    if not spk_path.exists():
+        return {}
+    try:
+        loaded = json.loads(spk_path.read_text())
+        if isinstance(loaded, dict):
+            return {str(k): v for k, v in loaded.items()
+                    if isinstance(v, dict) and v.get("name")}
+    except (json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def cmd_diarize(work, runner=None):
+    """--diarize (canticos-q73): pyannote the session recording, re-attribute
+    transcript lines by timestamp overlap, write speakers.json placeholders.
+    Never re-transcribes; unmatched lines keep their original ids."""
+    runner = runner or dia.run_pyannote
+    wav = work / "capture.wav"
+    tp = work / "transcript.txt"
+    if not wav.exists():
+        sys.stderr.write(f"interview-live: no capture.wav in {work} — nothing to diarize\n")
+        return 1
+    if not tp.exists():
+        sys.stderr.write(f"interview-live: no transcript.txt in {work} — nothing to re-label\n")
+        return 1
+    sys.stderr.write("interview-live: running pyannote diarization"
+                     " (first run may download ~2GB torch + models)…\n")
+    errors = []
+
+    def runner(wav):
+        return dia.run_pyannote(wav, on_error=lambda k, d: errors.append((k, d)))
+
+    rttm = runner(wav)
+    if rttm is None:
+        sys.stderr.write("interview-live: diarization failed — check HF_TOKEN"
+                         " (gated pyannote/speaker-diarization-3.1) and uv output\n")
+        if errors:
+            kind, detail = errors[-1]
+            sys.stderr.write(f"  reason: {kind}" + (f": {detail}" if detail else "") + "\n")
+        return 1
+    turns = dia.parse_rttm(rttm)
+    lines = tp.read_text().splitlines()
+    new_lines, label_ids = dia.assign_turn_speakers(lines, turns)
+    tp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""))
+    spk_path = work / "speakers.json"
+    existing_names = load_speakers_names(spk_path)
+    speakers = dia.placeholder_speakers(label_ids, existing_names)
+    spk_path.write_text(json.dumps(speakers, indent=2, ensure_ascii=False))
+    try:
+        log = evlog.EventLog(work / "events.jsonl")
+        log.emit("diarize_done", speakers=len(label_ids), turns=len(turns),
+                 relabeled=sum(1 for a, b in zip(lines, new_lines) if a != b))
+        log.close()
+    except OSError:
+        pass
+    roster = ", ".join(f"{sid}={names['name']}"
+                       for sid, names in sorted(speakers.items(), key=lambda kv: int(kv[0])))
+    sys.stdout.write(f"interview-live: diarized {len(label_ids)} speaker(s),"
+                     f" {len(turns)} turns — {roster}\n"
+                     f"  rename with: interview-live --session {work.name} --set-speaker N=Name\n")
+    return 0
 
 
 def sessions_root(args):
@@ -621,6 +693,8 @@ def main(argv=None):
         raise SystemExit(cmd_list(sessions_root(args), args.json))
     if args.adopt:
         raise SystemExit(cmd_adopt(sessions_root(args)))
+    if args.diarize:
+        raise SystemExit(cmd_diarize(sessions_root(args) / args.session))
     if args.set_speaker:
         work = sessions_root(args) / args.session
         if not work.is_dir():
