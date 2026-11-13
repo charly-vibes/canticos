@@ -9,6 +9,8 @@ Responsibilities:
     replays of the same log are byte-identical
   - Render the final state through a thin CLI (pretty JSON by default, compact
     canonical JSON with --json)
+  - Sweep a parameter grid over the reducer, forwarding each combination as
+    keyword arguments and reporting state-derived metrics in sorted order
 Rationale: canticos-qes — tuning suggestion parameters requires replaying a
   recorded session and comparing final state, not eyeballing a live dashboard.
   All freshness timestamps come from event ts values (or the caller-supplied
@@ -19,6 +21,7 @@ Rationale: canticos-qes — tuning suggestion parameters requires replaying a
 """
 
 import argparse
+import itertools
 import json
 import math
 import sys
@@ -162,6 +165,107 @@ def reduce_events(events, now=None):
     }
 
 
+SWEEP_METRICS = (
+    "pending_questions",
+    "expired_questions",
+    "dismissed_questions",
+    "asked_questions",
+    "topic_count",
+    "transcript_lines",
+    "top_question_score",
+    "last_ts",
+)
+
+
+def state_metrics(state):
+    """Per-run metrics derived only from the reducer's returned state."""
+    questions = state.get("questions")
+    questions = questions if isinstance(questions, list) else []
+    statuses = [q.get("status") for q in questions if isinstance(q, dict)]
+
+    def count(status):
+        return sum(1 for value in statuses if value == status)
+
+    top = questions[0] if questions else None
+    return {
+        "pending_questions": count("pending"),
+        "expired_questions": count("expired"),
+        "dismissed_questions": count("dismissed"),
+        "asked_questions": count("asked"),
+        "topic_count": len(state.get("topics") or []),
+        "transcript_lines": len(state.get("transcript") or []),
+        "top_question_score": top.get("score") if isinstance(top, dict) else None,
+        "last_ts": state.get("last_ts"),
+    }
+
+
+def _order_key(value):
+    """Total order over grid values: numbers, strings, then JSON fallback."""
+    if value is None:
+        return (0, 0, "")
+    if isinstance(value, bool):
+        return (1, int(value), "")
+    if isinstance(value, (int, float)):
+        return (2, value, "")
+    if isinstance(value, str):
+        return (3, 0, value)
+    return (4, 0, json.dumps(value, ensure_ascii=False, sort_keys=True, default=repr))
+
+
+def sweep(events, grid, runner=reduce_events):
+    """Run `runner` once per grid combination and derive per-run metrics.
+
+    `grid` maps parameter names to candidate values; every combination is passed
+    to `runner` as keyword arguments, so tuning parameters are injected instead
+    of patched into globals. `grid` key order defines the parameter tuple, and
+    results are sorted by that tuple, making repeated sweeps byte-identical.
+    """
+    names = list(grid)
+    combos = itertools.product(*(grid[name] for name in names)) if names else [()]
+    results = []
+    for combo in combos:
+        params = dict(zip(names, combo))
+        results.append({
+            "params": params,
+            "metrics": state_metrics(runner(events, **params)),
+        })
+    results.sort(key=lambda result: tuple(
+        _order_key(result["params"][name]) for name in names
+    ))
+    return results
+
+
+def _display(value):
+    if value is None:
+        return "null"
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=repr)
+
+
+def format_sweep(results):
+    """Fixed-width table: one row per combination, parameter columns first."""
+    param_names = list(results[0]["params"]) if results else []
+    headers = param_names + list(SWEEP_METRICS)
+    rows = []
+    for result in results:
+        row = [_display(result["params"].get(name)) for name in param_names]
+        row += [_display(result["metrics"].get(name)) for name in SWEEP_METRICS]
+        rows.append(row)
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    lines = [
+        "  ".join(header.ljust(widths[i]) for i, header in enumerate(headers)).rstrip()
+    ]
+    for row in rows:
+        lines.append(
+            "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip()
+        )
+    return "\n".join(lines)
+
+
 def dump_state(state, compact=False):
     """Canonical JSON: sorted keys and UTF-8 text make replays byte-comparable."""
     return json.dumps(
@@ -184,6 +288,11 @@ def main(argv=None):
         action="store_true",
         help="emit compact canonical JSON (default: indented JSON)",
     )
+    parser.add_argument(
+        "--sweep",
+        metavar="GRID_JSON",
+        help="run a parameter grid, e.g. '{\"now\": [1000, 2000]}'",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -191,6 +300,36 @@ def main(argv=None):
     except OSError as exc:
         print(f"interview-live-replay: {exc}", file=sys.stderr)
         return 1
+
+    if args.sweep is not None:
+        try:
+            grid = json.loads(args.sweep)
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(
+                f"interview-live-replay: invalid --sweep JSON: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(grid, dict) or any(
+            not isinstance(values, (list, tuple)) for values in grid.values()
+        ):
+            print(
+                "interview-live-replay: --sweep must be a JSON object mapping "
+                "parameter names to value lists",
+                file=sys.stderr,
+            )
+            return 2
+        results = sweep(events, grid)
+        if args.json:
+            print(json.dumps(
+                results,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ))
+        else:
+            print(format_sweep(results))
+        return 0
 
     state = reduce_events(events)
     print(dump_state(state, compact=args.json))

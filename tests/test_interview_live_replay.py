@@ -122,6 +122,125 @@ def test_reducer_takes_injected_clock():
     assert params["now"].default is None
 
 
+def test_sweep_runs_every_combination_in_sorted_order():
+    events = replay.load_events(FIXTURE)
+    grid = {"now": [2000, 1000]}
+    results = replay.sweep(events, grid)
+
+    assert len(results) == 2
+    assert [r["params"]["now"] for r in results] == [1000, 2000]
+    for result in results:
+        assert set(result) == {"params", "metrics"}
+        assert result["metrics"]["transcript_lines"] == 147
+        assert result["metrics"]["pending_questions"] >= 0
+
+    first = json.dumps(results, sort_keys=True, ensure_ascii=False)
+    second = json.dumps(replay.sweep(events, grid), sort_keys=True, ensure_ascii=False)
+    assert first == second
+
+
+def test_sweep_derives_metrics_from_reduced_state():
+    events = [
+        {"ts": 1.0, "type": "suggest_result",
+         "questions": ["primera", "segunda"], "topics": [{"name": "tema"}]},
+        {"ts": 2.0, "type": "question_asked", "text": "primera"},
+        {"ts": 3.0, "type": "question_dismissed", "text": "segunda"},
+        {"ts": 4.0, "type": "transcript_segment", "start_ms": 0,
+         "end_ms": 1000, "speaker": 0, "text": "hola"},
+    ]
+    metrics = replay.sweep(events, {})[0]["metrics"]
+
+    assert metrics["pending_questions"] == 0
+    assert metrics["asked_questions"] == 1
+    assert metrics["dismissed_questions"] == 1
+    assert metrics["expired_questions"] == 0
+    assert metrics["topic_count"] == 1
+    assert metrics["transcript_lines"] == 1
+    assert metrics["top_question_score"] == core.score_for("medium", 1)
+    assert metrics["last_ts"] == 4.0
+
+
+def test_sweep_forwards_arbitrary_kwargs_to_runner():
+    calls = []
+    sentinel = {
+        "session": None, "reason": None, "first_ts": None, "last_ts": 9.0,
+        "counts": {"batches": 0, "questions": 0, "topics": 0, "segments": 0},
+        "transcript": [], "questions": [], "topics": [],
+    }
+
+    def runner(events, **kwargs):
+        calls.append(dict(kwargs))
+        return sentinel
+
+    grid = {"alpha": [1, 2], "beta": ["x", "y"]}
+    results = replay.sweep([{"type": "noop"}], grid, runner=runner)
+
+    assert calls == [
+        {"alpha": 1, "beta": "x"},
+        {"alpha": 1, "beta": "y"},
+        {"alpha": 2, "beta": "x"},
+        {"alpha": 2, "beta": "y"},
+    ]
+    assert len(results) == 4
+    assert results[0]["metrics"]["last_ts"] == 9.0
+
+
+def test_sweep_empty_grid_yields_single_empty_combination():
+    calls = []
+
+    def runner(events, **kwargs):
+        calls.append(dict(kwargs))
+        return replay.reduce_events(events)
+
+    results = replay.sweep([], {}, runner=runner)
+
+    assert calls == [{}]
+    assert len(results) == 1
+    assert results[0]["params"] == {}
+    assert results[0]["metrics"]["top_question_score"] is None
+    assert results[0]["metrics"]["last_ts"] is None
+
+
+def test_sweep_takes_injected_runner_and_reads_no_wall_clock():
+    params = inspect.signature(replay.sweep).parameters
+    assert params["runner"].default is replay.reduce_events
+
+    source = inspect.getsource(replay)
+    for token in ("time.time", "time.monotonic", "time.perf_counter",
+                  "perf_counter", "datetime.now", "datetime.utcnow"):
+        assert token not in source
+
+
+def test_cli_sweep_emits_json_and_readable_table():
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), str(FIXTURE), "--sweep",
+         '{"now": [1000, 2000]}', "--json"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(proc.stdout)
+    assert [result["params"]["now"] for result in data] == [1000, 2000]
+    assert all("metrics" in result for result in data)
+
+    table = subprocess.run(
+        [sys.executable, str(SCRIPT), str(FIXTURE), "--sweep",
+         '{"now": [1000, 2000]}'],
+        capture_output=True, text=True, check=True,
+    )
+    assert "now" in table.stdout
+    assert "1000" in table.stdout and "2000" in table.stdout
+    assert "pending_questions" in table.stdout
+    assert "top_question_score" in table.stdout
+
+
+def test_cli_rejects_malformed_sweep_grid():
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), str(FIXTURE), "--sweep", '{"now": 1000}'],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "--sweep" in proc.stderr
+
+
 def test_cli_matches_reducer_and_is_stable():
     state = _reduce_fixture()
     proc = subprocess.run(
