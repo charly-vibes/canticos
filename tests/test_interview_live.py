@@ -781,6 +781,12 @@ def test_plain_pi_output_fallback(env):
     data = json.loads(des[0].read_text())
     assert data["topics"] == []
     assert any("supplier problem" in it["text"] for it in data["questions"])
+    # canticos-a6q: the new payload fields are emitted for plain output too
+    files = [f for f in out_files(env, ".jsonl") if "events" in f.name]
+    lines = [json.loads(l) for l in files[0].read_text().splitlines() if l.strip()]
+    res = next(e for e in lines if e["type"] == "suggest_result")
+    assert "Q1: Tell me more about the supplier problem" in res["raw_output"]
+    assert "proveedor" in res["input_lines"].lower()
 
 
 def test_queue_logic_unit(capsys):
@@ -855,6 +861,38 @@ def test_from_mode_writes_event_log(env):
     assert any(e["type"] == "transcript_segment" and e["speaker"] == 1 for e in lines)
     assert any(e["type"] == "suggest_result" for e in lines)
     assert lines[-1]["type"] == "session_end"
+
+
+def test_suggest_result_carries_input_and_raw_output(env):
+    """canticos-a6q: suggest_result must record the exact prompt input sent to
+    pi and pi's raw stdout, so a bad batch can be attributed to the prompt vs
+    the transcript context after the fact. Both fields stay flat strings so
+    jq filters like `.input_lines` work without nesting."""
+    env['PI_MODE'] = 'json'
+    rec = Path(env['HOME']) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run(env, "--from", str(rec))
+    assert r.returncode == 0, r.stderr
+    files = [f for f in out_files(env, ".jsonl") if "events" in f.name]
+    lines = [json.loads(l) for l in files[0].read_text().splitlines() if l.strip()]
+    results = [e for e in lines if e["type"] == "suggest_result"]
+    assert results, "no suggest_result event"
+    for e in results:
+        # a transcript line that was actually sent to pi
+        assert isinstance(e["input_lines"], str)
+        assert "proveedor" in e["input_lines"].lower()
+        assert "[00:00:05] (speaker 1) Bueno, el mes pasado tuvimos un problema con el proveedor" in e["input_lines"]
+        # pi's stdout verbatim, before any parsing/stripping
+        assert isinstance(e["raw_output"], str)
+        assert "Q-A: Tell me more about the supplier problem" in e["raw_output"]
+        assert "Proveedor" in e["raw_output"]  # still the unparsed JSON blob
+        assert e["raw_output"].endswith("\n")  # verbatim stdout, not the stripped `out`
+    # unchanged suggestion behavior: the parsed payload is still there too
+    first = results[0]
+    assert any("supplier problem" in q for q in first["questions"])
+    assert any(t["name"] == "Proveedor" for t in first["topics"])
+    # input_lines is byte-identical to the transcript argument pi actually got
+    assert first["input_lines"] == log_lines(env, "PI")[0][-1]
 
 
 def test_whisper_timeout_returns_empty(monkeypatch):

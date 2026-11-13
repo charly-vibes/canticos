@@ -183,8 +183,9 @@ class InterviewLive:
             self._suggest_q.put((self._suggest_seq, list(lines), first))
 
     def suggest(self, new_lines, first):
+        input_lines = "\n".join(new_lines)
         cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
-                               self.participants, self.ui, "\n".join(new_lines))
+                               self.participants, self.ui, input_lines)
         if self.ui:
             self.ui.suggestion = "thinking"
         try:
@@ -227,6 +228,8 @@ class InterviewLive:
                 for t in topics:
                     fh.write(f"- {t['name']} ({t['priority']}): {t['note']}\n")
         self.log.emit("suggest_result",
+                      input_lines=input_lines,
+                      raw_output=r.stdout,
                       questions=[q["text"] for q in questions],
                       topics=topics)
         if self.ui:
