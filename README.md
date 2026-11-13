@@ -66,13 +66,14 @@ interview-live --session ana-noviembre --diarize             # pyannote N-speake
 | `--from FILE` | Replay de una sola pasada (una transcripción completa, sin streaming) |
 | `--diarize` | Re-diariza `capture.wav` con pyannote (N speakers) y reasigna líneas por solapamiento temporal; requiere `--session` y `HF_TOKEN`, corre en un entorno efímero de `uv` (el primer run baja torch, ~2 GB) y no se combina con `--list`/`--adopt`/`--set-speaker` |
 | `--participants N` | Cantidad de participantes (default 2); alimenta el roster de la TUI y el system prompt de pi |
+| `--question-model MODEL` | Modelo fuerte opcional para el questioner (env `$INTERVIEW_QUESTION_MODEL`); presupuesto de 45 s y fallback único a `--pi-model` con evento `suggest_fallback`. Sin la flag el argv de pi no cambia |
 | `--no-tui` / `--tui` | Fuerza salida plana o el dashboard curses (default: automático según TTY) |
 
 Defaults pensados para entrevistas en español: `--language es` (el `auto` por ventana se equivoca con clips cortos), `--every 5` segundos entre pasadas de whisper y `--min-segments 1`. Whisper usa `$WHISPER_MODEL` si está seteado; si no, prefiere `~/models/ggml-large-v3-turbo.bin` y cae a `ggml-base.bin`. El modelo de pi es `qwen-token-plan-individual/qwen3.8-flash` (override `--pi-model` / `$INTERVIEW_PI_MODEL`).
 
 **Cuándo sugiere.** Los segmentos se acumulan y el batch se dispara al terminar el turno del invitado (piso de silencio de 1,2 s), al superar 25 s de monólogo, con la tecla `f` en la TUI (pedir ahora) o en el flush de fin de corrida; nunca una vez por ronda. Si llegan batches más nuevos mientras pi está ocupado, los viejos se descartan pero sus líneas se suman al batch nuevo (coalescen: no se pierde ningún segmento del transcript), dejando `suggest_trigger` / `suggest_stale_drop` en `events.jsonl`.
 
-Cifras de referencia medidas sobre la sesión `~/Interviews/interview-20261113-084517` (83,5 min, 222 batches, 628 preguntas, cadencia mediana 21 s); no se copian de las propuestas externas.
+Cifras de referencia medidas sobre la sesión `~/Interviews/interview-20261113-084517` (83,5 min, 222 batches, 631 preguntas, 12 batches sin preguntas = 5,4 %, cadencia mediana 21 s); no se copian de las propuestas externas. Para medir una sesión: `bin/interview_live_metrics.py <session>/events.jsonl [--json]` (ratios, batches sin preguntas/topic-only, preguntas por minuto, cadencia mediana, acted-on, repair rate, tiempo a la primera pregunta) y `bin/interview_live_replay.py <events.jsonl> [--json|--sweep '<grid>'|--knowledge]` (reducer determinista, barridos de parámetros y ledger turu opcional).
 
 ### terapia
 
