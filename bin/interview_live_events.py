@@ -2,8 +2,9 @@
 """Purpose: Append-only, thread-safe JSONL event log for interview-live sessions.
 Responsibilities:
   - Emit typed events (session_start, capture_start, transcript_segment,
-    whisper_error, suggest_result, suggest_error, participants_set, session_end)
-    as one JSON object per line, in wall-clock order, with ts/seq metadata
+    whisper_error, suggest_trigger, suggest_stale_drop, suggest_result,
+    suggest_error, participants_set, session_end) as one JSON object per line,
+    in wall-clock order, with ts/seq metadata
   - Append (never truncate) so a session survives crashes and replays cleanly
   - Serialize writes with a lock: the TUI worker thread and the main thread both emit
 Rationale: canticos-2vz — an audit trail enables replay, debugging, post-hoc

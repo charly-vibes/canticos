@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-13
+
+### Changed
+- `interview-live`: **conversation-driven suggestion cadence** (canticos-2iv) — new pure `bin/interview_live_trigger.py` (`TriggerPolicy`, injected clock) replaces the per-round enqueue: batches now fire on guest turn end (1.2s quiet floor P-01, verdict in audio time or wall clock), on a guest monologue cap (25s P-02), on the TUI `f` force key, or on the end-of-run flush — so cadence follows the interview instead of the `--every` timer. The suggester thread drops stale queued batches when a newer one is pending but carries their lines into the newest batch (no segment loss), logging `suggest_trigger` / `suggest_stale_drop` events. Tests: 7 new (`-k trigger`), including a stale-drop integration run proving 8 triggers coalesce into 2 pi calls with every transcript line preserved.
+
 ## 2026-11-12
 
 ### Added

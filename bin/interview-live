@@ -6,7 +6,8 @@
 # Responsibilities (thin coordinator):
 #   - Wire the modular pipeline: capture (interview_live_capture), transcription
 #     (interview_live_whisper), suggestions (interview_live_suggest), event log
-#     (interview_live_events), queue model (interview_live_core), dashboard (tui)
+#     (interview_live_events), queue model (interview_live_core), batch trigger
+#     policy (interview_live_trigger), dashboard (tui)
 #   - Own the worker loop (offsets, file artifacts, TUI state mirroring) and the
 #     TUI worker-thread orchestration
 #   - Append a chronological events.jsonl audit trail for the whole session
@@ -35,6 +36,7 @@ import interview_live_diarize as dia  # noqa: E402
 import interview_live_events as evlog  # noqa: E402
 import interview_live_suggest as sug  # noqa: E402
 import interview_live_tui as tui  # noqa: E402
+import interview_live_trigger as trig  # noqa: E402
 import interview_live_whisper as whisper  # noqa: E402
 
 
@@ -62,6 +64,8 @@ class InterviewLive:
         self._replay_pos_ms = 0
         self._replay_total_ms = 0
         self._suggest_q = queue.Queue()
+        self._suggest_lock = threading.Lock()
+        self._suggest_seq = 0   # newest enqueued batch id (stale-drop, canticos-2iv)
         self._suggest_thread = None
         self.interrupted = False
         self.participants = args.participants
@@ -130,13 +134,26 @@ class InterviewLive:
     # -- suggestions -----------------------------------------------------------
     def _start_suggester(self):
         """Background thread running pi batches so the transcription loop never
-        blocks on suggestions (the TUI transcript froze for 8-20s per batch)."""
+        blocks on suggestions (the TUI transcript froze for 8-20s per batch).
+        canticos-2iv: when newer batches queue up while pi is busy, older ones
+        are skipped, but their lines ride along with the newest batch — a stale
+        drop must never remove transcript segments from the model's view."""
         def loop():
+            carry, carry_first = [], False
             while True:
                 item = self._suggest_q.get()
                 if item is None:
                     break
-                lines, first = item
+                seq, lines, first = item
+                carry.extend(lines)
+                carry_first = carry_first or first
+                with self._suggest_lock:
+                    newest = self._suggest_seq
+                if seq < newest:
+                    self.log.emit("suggest_stale_drop", skipped=seq, newest=newest)
+                    continue
+                lines, first = carry, carry_first
+                carry, carry_first = [], False
                 try:
                     self.suggest(lines, first)
                 except Exception as e:  # noqa: BLE001 — one bad batch must not kill suggestions
@@ -144,6 +161,11 @@ class InterviewLive:
                         self.log.emit("suggest_error", reason=f"thread:{type(e).__name__}:{e}")
                     except Exception:  # noqa: BLE001 — log may be closing at shutdown
                         pass
+            if carry:  # defensive: never discard carried lines at shutdown
+                try:
+                    self.suggest(carry, carry_first)
+                except Exception:  # noqa: BLE001
+                    pass
         self._suggest_thread = threading.Thread(target=loop, daemon=True)
         self._suggest_thread.start()
 
@@ -156,7 +178,9 @@ class InterviewLive:
             self._suggest_thread = None
 
     def _enqueue_suggestions(self, lines, first):
-        self._suggest_q.put((lines, first))
+        with self._suggest_lock:
+            self._suggest_seq += 1
+            self._suggest_q.put((self._suggest_seq, list(lines), first))
 
     def suggest(self, new_lines, first):
         cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
@@ -269,15 +293,35 @@ class InterviewLive:
     def _run_loop(self, rounds):
         """Worker loop shared by plain output and the TUI worker thread.
         When self.ui is set, events are mirrored into the dashboard state and
-        nothing is written to stdout (the terminal belongs to curses)."""
+        nothing is written to stdout (the terminal belongs to curses).
+        Suggestion batches fire on conversation events (guest turn end, long
+        monologue), a manual force, or the end-of-run flush — never once per
+        transcription round (canticos-2iv)."""
         ui = self.ui
         offset_ms = 0
         first = True
-        pending = []
+        policy = trig.TriggerPolicy(min_segments=self.args.min_segments)
         window_s = self.args.window or self.args.every
 
         def on_whisper_error(kind, detail=None):
             self.log.emit("whisper_error", kind=kind, detail=detail)
+
+        def fire(force=False):
+            """Enqueue the pending batch when the policy (or a manual force)
+            says so; returns True when a batch was enqueued."""
+            nonlocal first
+            reason = "force" if force else policy.due(time.monotonic())
+            if not reason:
+                return False
+            drained = policy.drain()
+            if not drained:
+                return False
+            self.log.emit("suggest_trigger", reason=reason, segments=len(drained))
+            self._enqueue_suggestions(
+                [core.render_segment_line(s[0], s[2], s[3], self.speaker_names)
+                 for s in drained], first)
+            first = False
+            return True
 
         for _ in range(rounds):
             if self.interrupted:
@@ -293,6 +337,13 @@ class InterviewLive:
                     sys.stderr.write("interview-live: ffmpeg capture exited early — stopping"
                                      f" (see {self.work / 'ffmpeg.log'})\n")
                     break
+            # Decide AFTER the round's wait: the quiet floor is measured across
+            # it, so a guest turn end observed last round can fire now.
+            if ui is not None and ui.force_request:
+                ui.force_request = False
+                fire(force=True)
+            else:
+                fire()
             if self.args.replay:
                 # slice the next window and transcribe it as if it just arrived
                 win_path = self.work / f"window-{self._replay_pos_ms}.wav"
@@ -314,8 +365,7 @@ class InterviewLive:
                 lines = []
                 for start, end, spk, text in segs:
                     offset_ms = max(offset_ms, end)
-                    line = core.render_segment_line(start, spk, text, self.speaker_names)
-                    lines.append(line)
+                    lines.append(core.render_segment_line(start, spk, text, self.speaker_names))
                     if ui:
                         ui.transcript.append((start, spk, text))
                     self.log.emit("transcript_segment", start_ms=start, end_ms=end,
@@ -326,13 +376,13 @@ class InterviewLive:
                     ui.last_offset_ms = offset_ms
                 else:
                     sys.stdout.write("\n".join(lines) + "\n")
-                pending.extend(lines)
-                if len(pending) >= self.args.min_segments:
-                    self._enqueue_suggestions(pending, first)
-                    pending = []
-                    first = False
+                policy.add(segs, time.monotonic())
             if self.args.from_file:
                 break  # replay: one pass
+        # Never lose the tail: flush the last batch (subject to the same
+        # --min-segments floor that suppresses suggestions in noise-only runs).
+        if policy.pending_count >= self.args.min_segments:
+            fire(force=True)
 
     def _run_tui(self, rounds):
         """Run the worker loop on a background thread while curses owns the terminal."""

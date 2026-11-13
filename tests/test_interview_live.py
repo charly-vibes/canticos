@@ -22,6 +22,7 @@ import interview_live_core as core  # noqa: E402
 import interview_live_diarize as dia  # noqa: E402
 import interview_live_events as evlog  # noqa: E402
 import interview_live_suggest as sug  # noqa: E402
+import interview_live_trigger as trig  # noqa: E402
 import interview_live_whisper as wh  # noqa: E402
 
 BIN = Path(__file__).resolve().parents[1] / "bin" / "interview-live"
@@ -54,7 +55,18 @@ shift = 0
 for a in args:
     if a.endswith('.wav') and 'window-' in a:
         shift = int(a.split('window-')[1].split('.wav')[0]) // 1000
-if '-ot' in args and args[args.index('-ot') + 1] == '0' and shift == 0:
+if os.environ.get('WHISPER_STREAM'):
+    ot = 0
+    if '-ot' in args:
+        ot = int(args[args.index('-ot') + 1]) // 1000
+    def ts(t):
+        return "%02d:%02d:%02d.000" % (t // 3600, t % 3600 // 60, t % 60)
+    st = ot + 1
+    lines = [
+        "[%s --> %s]  (speaker 1) guest point %d" % (ts(st), ts(st + 2), ot),
+        "[%s --> %s]  (speaker 0) follow up %d" % (ts(st + 4), ts(st + 6), ot),
+    ]
+elif '-ot' in args and args[args.index('-ot') + 1] == '0' and shift == 0:
     lines = [
         "[00:00:01.000 --> 00:00:04.000]  (speaker 0) Hola, cuentame sobre tu ultimo proyecto",
         "[00:00:05.000 --> 00:00:09.000]  (speaker 1) Bueno, el mes pasado tuvimos un problema con el proveedor",
@@ -599,8 +611,10 @@ def test_transcription_continues_while_pi_thinks(env):
     froze transcript updates for its whole duration; suggestions must run
     asynchronously so live transcription never waits on pi, and pending
     batches are flushed (joined) before exit."""
-    env_ = {**env, "PI_SLEEP": "2"}
-    r = run(env_, "--rounds", "4", "--every", "0.5", "--min-segments", "1", live=True)
+    env_ = {**env, "PI_SLEEP": "3"}
+    # turn-end triggers only fire once the 1.2s quiet floor has passed across a
+    # round boundary, so give rounds room (canticos-2iv changed the cadence).
+    r = run(env_, "--rounds", "4", "--every", "2.5", "--min-segments", "1", live=True)
     assert r.returncode == 0, r.stderr
     order = Path(env_["ORDER_LOG"]).read_text().split()
     w_idx = [i for i, x in enumerate(order) if x == "W"]
@@ -616,7 +630,9 @@ def test_transcription_continues_while_pi_thinks(env):
 
 
 def test_live_mode_pi_session_continuity(env):
-    run(env, "--rounds", "2", "--every", "1", "--min-segments", "1", live=True)
+    # 3 rounds / 2s: round 3 fires the first batch (turn-end + quiet floor),
+    # the end-of-run flush fires the second.
+    run(env, "--rounds", "3", "--every", "2", "--min-segments", "1", live=True)
     calls = log_lines(env, "PI")
     assert len(calls) == 2
     first, second = calls[0], calls[1]
@@ -735,7 +751,8 @@ def test_participants_default_two(env):
 
 def test_queue_json_recurrence_and_dedupe(env):
     env['PI_MODE'] = 'json'
-    r = run(env, "--rounds", "2", "--every", "1", "--min-segments", "1", live=True)
+    # two trigger points (round 2 turn-end, round 3 turn-end) -> two batches
+    r = run(env, "--rounds", "3", "--every", "2", "--min-segments", "1", live=True)
     assert r.returncode == 0, r.stderr
     des = [f for f in out_files(env, ".json") if "queue" in f.name]
     assert des, "queue.json never written"
@@ -886,3 +903,85 @@ def test_effective_participants_tui_overrides_args():
         participants = 4
 
     assert sug.effective_participants(2, Stub()) == 4
+
+# -- trigger policy (canticos-2iv) -------------------------------------------
+# Measured baseline: 222 batches / 83.5min (median 21s), 628 questions, 587
+# manual dismissals. Batches must follow the conversation, not the round timer.
+
+def test_trigger_policy_turn_end_after_quiet_floor():
+    p = trig.TriggerPolicy(min_segments=1)
+    p.add([(0, 2000, 1, "guest")], now=0.0)
+    assert p.due(0.5) is None, "guest still holds the floor"
+    p.add([(3000, 4000, 0, "interviewer")], now=1.0)  # 1s audio gap < 1.2s floor
+    assert p.due(1.0) is None, "quiet floor not met yet"
+    assert p.due(2.2) == "turn-end"
+    assert p.drain() == [(0, 2000, 1, "guest"), (3000, 4000, 0, "interviewer")]
+    assert p.due(9.0) is None, "a drained policy must not re-fire"
+
+
+def test_trigger_policy_turn_end_uses_audio_pause():
+    """Replay/from-file windows arrive back-to-back in wall time: a >=1.2s
+    pause in the audio itself proves the guest yielded the floor."""
+    p = trig.TriggerPolicy()
+    p.add([(0, 2000, 1, "guest")], now=0.0)
+    p.add([(5000, 6000, 0, "interviewer")], now=0.1)
+    assert p.due(0.1) == "turn-end"
+
+
+def test_trigger_policy_monologue_cap_fires_without_turn_end():
+    p = trig.TriggerPolicy()
+    p.add([(0, 12000, 1, "a"), (12000, 24000, 1, "b")], now=0)
+    assert p.due(0) is None, "24s monologue is still under the 25s cap"
+    p.add([(24000, 26000, 1, "c")], now=0)
+    assert p.due(0) == "monologue"
+    assert len(p.drain()) == 3
+
+
+def test_trigger_policy_interviewer_only_never_fires():
+    p = trig.TriggerPolicy()
+    p.add([(0, 3000, 0, "q1"), (3000, 6000, 0, "q2")], now=0)
+    assert p.due(1000.0) is None
+
+
+def test_trigger_policy_coalesces_and_keeps_every_segment():
+    p = trig.TriggerPolicy()
+    segs = [(0, 1000, 1, "a"), (1000, 2000, 1, "b"), (3000, 4000, 0, "c")]
+    p.add(segs[:2], now=0)
+    assert p.pending_count == 2 and p.due(10) is None
+    p.add(segs[2:], now=1)
+    assert p.due(1) is None, "quiet floor starts at the turn-end observation"
+    assert p.drain() == segs, "drain must return every segment exactly once"
+    assert p.pending_count == 0 and p.drain() == []
+
+
+def test_trigger_policy_min_segments_floor():
+    p = trig.TriggerPolicy(min_segments=3)
+    p.add([(0, 2000, 1, "g"), (4000, 5000, 0, "i")], now=0)
+    assert p.due(99) is None, "below the configured floor"
+    p.add([(6000, 7000, 0, "j")], now=1)
+    assert p.due(99) == "turn-end"
+
+
+def test_trigger_stale_batches_coalesce_without_losing_lines(env):
+    """EDGE-002: when pi is still thinking and newer batches queue up, stale
+    batches are dropped — but their lines must ride along with the newest one,
+    so no transcript segment vanishes from the model's view.
+
+    WHISPER_STREAM emits a >=1.2s audio pause after each guest turn, so every
+    round produces a confirmed turn end; pi is slower than the round cadence,
+    which builds the backlog the stale-drop path exists for."""
+    env_ = {**env, "PI_SLEEP": "4", "WHISPER_STREAM": "1"}
+    r = run(env_, "--rounds", "8", "--every", "0.2", "--min-segments", "1",
+            live=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    calls = log_lines(env_, "PI")
+    assert calls, "no suggestion batches ran"
+    assert len(calls) < 5, f"stale-drop did not coalesce: {len(calls)} pi calls"
+    prompts = "\n".join(" ".join(c) for c in calls)
+    lost = [line for line in transcript_text(env_).splitlines()
+            if line.strip() and line not in prompts]
+    assert not lost, f"transcript lines lost from pi prompts: {lost}"
+    events = [json.loads(line) for f in out_files(env_, ".jsonl")
+              for line in f.read_text().splitlines() if line.strip()]
+    assert any(e["type"] == "suggest_trigger" for e in events), events
+    assert any(e["type"] == "suggest_stale_drop" for e in events), events

@@ -5,7 +5,7 @@ Responsibilities:
   - Render a live transcript pane and a prioritized queue pane (pi questions
     + important topics with recurrence counts)
   - Observe-only by default: nothing required from the user; optional keys
-    (q quit, space mark top question asked, PgUp/PgDn scroll transcript)
+    (q quit, space mark top question asked, f ask now, PgUp/PgDn scroll transcript)
 Rationale: canticos-c02 — an interviewing copilot is a dashboard you glance at,
   not a form you fill. build_layout() is kept pure (no curses) so the layout
   logic is unit-testable; curses is imported lazily so plain/pipe mode never
@@ -47,6 +47,7 @@ class TuiState:
         self.started = time.time()
         self.last_offset_ms = 0
         self.suggestion = "idle"      # idle | thinking | done | error
+        self.force_request = False    # canticos-2iv: 'f' asks pi for a round now
         self.speaker_names = speaker_names or {}  # canticos-uzv: id -> {"name"}
 
 
@@ -111,7 +112,7 @@ def build_layout(ui, width, height, scroll=0, now=None):
     queue = [e for e in entries[:cap_q]]
 
     footer = _clip(
-        "q quit | space: mark top question asked | PgUp/PgDn: scroll (observe-only)",
+        "q quit | space: mark top question asked | f: ask now | PgUp/PgDn: scroll",
         width,
     )
 
@@ -239,6 +240,8 @@ def run_dashboard(stdscr, ui, participants_default, stop_check=lambda: False):
             top = ui.queue.top_pending_question()
             if top:
                 ui.queue.mark_asked(top["key"])
+        elif ch == ord("f"):
+            ui.force_request = True   # trigger a suggestion round now
         elif ch in (curses.KEY_PPAGE, ord("u")):
             scroll += 6
         elif ch in (curses.KEY_NPAGE, ord("d")):
