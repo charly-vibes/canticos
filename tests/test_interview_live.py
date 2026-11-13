@@ -1023,3 +1023,24 @@ def test_trigger_stale_batches_coalesce_without_losing_lines(env):
               for line in f.read_text().splitlines() if line.strip()]
     assert any(e["type"] == "suggest_trigger" for e in events), events
     assert any(e["type"] == "suggest_stale_drop" for e in events), events
+
+
+def test_plain_mode_emits_question_shown(env):
+    """canticos-vvc: a plain stdout suggestion round logs question_shown for the
+    questions it renders, exactly once each, and no question_asked when nobody
+    interacted with the dashboard."""
+    rec = Path(env['HOME']) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run(env, "--from", str(rec))
+    assert r.returncode == 0, r.stderr
+    files = [f for f in out_files(env, ".jsonl") if "events" in f.name]
+    assert files, "events.jsonl never written"
+    lines = [json.loads(l) for l in files[0].read_text().splitlines() if l.strip()]
+    shown = [e for e in lines if e["type"] == "question_shown"]
+    assert shown, "no question_shown event"
+    assert any("supplier problem" in e["text"] for e in shown)
+    for e in shown:
+        assert {"key", "text", "priority", "score"} <= set(e)
+        assert e["priority"] in ("high", "medium", "low")
+    assert len(shown) == len({e["key"] for e in shown}), "question_shown re-emitted"
+    assert not [e for e in lines if e["type"] == "question_asked"]

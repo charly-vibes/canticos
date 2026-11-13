@@ -6,10 +6,13 @@ Responsibilities:
     + important topics with recurrence counts)
   - Observe-only by default: nothing required from the user; optional keys
     (q quit, space mark top question asked, f ask now, PgUp/PgDn scroll transcript)
+  - Emit question lifecycle events (question_shown / question_asked /
+    question_dismissed) through an injectable sink (canticos-vvc)
 Rationale: canticos-c02 — an interviewing copilot is a dashboard you glance at,
   not a form you fill. build_layout() is kept pure (no curses) so the layout
   logic is unit-testable; curses is imported lazily so plain/pipe mode never
-  depends on ncurses.
+  depends on ncurses. canticos-vvc — the sink defaults to a no-op so the purity
+  of layout tests survives while the coordinator wires the real EventLog.
 """
 
 import sys
@@ -36,10 +39,21 @@ def role_label(speaker, n):
     return "You" if speaker == 0 else guest_label(n)
 
 
+def _noop_emit(_etype, **_payload):
+    """Default sink: pure layout and unit tests need no EventLog."""
+
+
+def emit_question(emit, etype, q):
+    """Shared emit helper: every question lifecycle event carries the same
+    identity payload (key/text/priority/score), so jq filters stay stable."""
+    emit(etype, key=q["key"], text=q["text"],
+         priority=q["priority"], score=q["score"])
+
+
 class TuiState:
     """Shared state mutated by the worker thread, rendered by the TUI thread."""
 
-    def __init__(self, queue=None, speaker_names=None):
+    def __init__(self, queue=None, speaker_names=None, emit=None):
         self.participants = 2
         self.transcript = []          # [(start_ms, speaker, text), ...]
         self.queue = queue or core.Queue()
@@ -49,6 +63,29 @@ class TuiState:
         self.suggestion = "idle"      # idle | thinking | done | error
         self.force_request = False    # canticos-2iv: 'f' asks pi for a round now
         self.speaker_names = speaker_names or {}  # canticos-uzv: id -> {"name"}
+        self.emit = emit or _noop_emit  # canticos-vvc: event sink (EventLog.emit)
+
+    def note_shown(self, q):
+        """Render hook: emit question_shown the first time a pending question
+        appears in the view; later frames are no-ops (queue owns the flag)."""
+        shown = self.queue.mark_shown(q["key"])
+        if shown:
+            emit_question(self.emit, "question_shown", shown)
+
+    def mark_asked(self, key):
+        """Ask transition: queue status plus the question_asked event."""
+        q = self.queue.mark_asked(key)
+        if q:
+            emit_question(self.emit, "question_asked", q)
+        return q
+
+    def mark_dismissed(self, key):
+        """Dismiss transition for the future 'd' binding: queue status plus the
+        question_dismissed event."""
+        q = self.queue.mark_dismissed(key)
+        if q:
+            emit_question(self.emit, "question_dismissed", q)
+        return q
 
 
 def _clip(text, width):
@@ -63,10 +100,12 @@ def _clip(text, width):
 
 
 def build_layout(ui, width, height, scroll=0, now=None):
-    """Pure layout: no curses, no I/O — unit-testable.
+    """No curses and no direct I/O — unit-testable.
 
     Returns a dict with header / transcript / queue / footer line lists and the
-    transcript scroll position. Rendering (colors, cursor) is an orthagonal,
+    transcript scroll position. The single side effect is the question_shown
+    lifecycle emit through ui.emit (no-op by default) for pending questions
+    entering the queue pane. Rendering (colors, cursor) is an orthagonal,
     untested thin layer in draw().
     """
     now = now if now is not None else time.time()
@@ -101,15 +140,22 @@ def build_layout(ui, width, height, scroll=0, now=None):
 
     # --- priority queue pane ----------------------------------------------
     cap_q = max(0, main_h - 1)
-    entries = []  # (kind, priority_mark, text)
+    entries = []  # (kind, priority_mark, text, status, priority)
+    pending_rendered = []  # canticos-vvc: pending questions in this frame's view
     for q in ui.queue.ranked_questions():
         mark = "*" if q["priority"] == "high" else ("+" if q["priority"] == "medium" else "-")
         prefix = "[x] " if q["status"] == "asked" else f"{mark} "
         entries.append(("Q", prefix + q["text"], q["status"], q["priority"]))
+        if q["status"] == "pending":
+            pending_rendered.append(q)
     for t in ui.queue.ranked_topics():
         mark = "*" if t["priority"] == "high" else ("+" if t["priority"] == "medium" else "-")
         entries.append(("T", f"{mark} {t['name']} x{t['mentions']}", "topic", t["priority"]))
     queue = [e for e in entries[:cap_q]]
+    # Pending questions sort first, so the pane's first cap_q rows are exactly
+    # pending_rendered[:cap_q]; emitting is build_layout's only side effect.
+    for q in pending_rendered[:cap_q]:
+        ui.note_shown(q)
 
     footer = _clip(
         "q quit | space: mark top question asked | f: ask now | PgUp/PgDn: scroll",
@@ -239,7 +285,7 @@ def run_dashboard(stdscr, ui, participants_default, stop_check=lambda: False):
         elif ch == ord(" "):
             top = ui.queue.top_pending_question()
             if top:
-                ui.queue.mark_asked(top["key"])
+                ui.mark_asked(top["key"])
         elif ch == ord("f"):
             ui.force_request = True   # trigger a suggestion round now
         elif ch in (curses.KEY_PPAGE, ord("u")):

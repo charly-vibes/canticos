@@ -236,6 +236,16 @@ class InterviewLive:
             self.ui.suggestion = "done"
         else:
             sys.stdout.write(f"\n--- follow-up questions ({time.strftime('%H:%M:%S')}) ---\n{out}\n\n")
+            self._emit_shown()
+
+    def _emit_shown(self):
+        """Plain mode's rendered view is the stdout round, so every unshown
+        pending question is one just printed (shown ones were flagged when
+        their batch rendered). canticos-vvc — same event as the TUI frame."""
+        for q in self.queue.pending_questions():
+            shown = self.queue.mark_shown(q["key"])
+            if shown:
+                tui.emit_question(self.log.emit, "question_shown", shown)
 
     def _write_queue_json(self):
         participants = sug.effective_participants(self.participants, self.ui)
@@ -761,9 +771,11 @@ def main(argv=None):
         if not (sys.stdout.isatty() and tui.available()):
             sys.stderr.write("interview-live: --tui needs an interactive terminal with curses — use --no-tui\n")
             raise SystemExit(2)
-        tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names)
+        tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names,
+                               emit=tool.log.emit)
     elif args.tui is None and sys.stdout.isatty() and tui.available():
-        tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names)
+        tool.ui = tui.TuiState(queue=tool.queue, speaker_names=tool.speaker_names,
+                               emit=tool.log.emit)
 
     def handler(signum, frame):
         tool.interrupted = True

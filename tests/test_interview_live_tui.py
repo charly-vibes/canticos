@@ -189,3 +189,86 @@ def test_layout_scroll_back_reveals_older_lines():
     t1 = [t for _, t in lay1["transcript"]]
     assert "line 39" in t0[-1]
     assert "line 39" not in t1[-1] and lay1["scroll"] == 10
+
+
+# ---------------------------------------------------------------------------
+# question lifecycle events (canticos-vvc)
+# ---------------------------------------------------------------------------
+
+def event_ui():
+    """TuiState with a fake sink: layout/state tests need no EventLog."""
+    events = []
+
+    def sink(etype, **payload):
+        events.append((etype, payload))
+
+    ui = tui.TuiState(emit=sink)
+    return ui, events
+
+
+def test_question_shown_emitted_once_across_rerenders():
+    """A pending question that stays in the rendered view is 'shown' exactly
+    once — repeated frames must not re-emit it."""
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "Cuentame del problema del proveedor",
+                                "priority": "high"}])
+    tui.build_layout(ui, 100, 24)
+    tui.build_layout(ui, 100, 24)
+    shown = [p for e, p in events if e == "question_shown"]
+    assert len(shown) == 1
+    q = ui.queue.top_pending_question()
+    assert shown[0] == {"key": q["key"], "text": q["text"],
+                        "priority": q["priority"], "score": q["score"]}
+
+
+def test_question_shown_not_emitted_for_asked_or_dismissed():
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "primera pregunta", "priority": "high"},
+                               {"text": "segunda pregunta", "priority": "medium"}])
+    keys = [q["key"] for q in ui.queue.ranked_questions()]
+    ui.queue.mark_asked(keys[0])
+    ui.queue.mark_dismissed(keys[1])
+    tui.build_layout(ui, 100, 24)
+    assert [p for e, p in events if e == "question_shown"] == []
+
+
+def test_mark_asked_and_dismissed_emit_typed_events():
+    """The state stub emits question_asked / question_dismissed with the
+    question payload; ask still wins the status field."""
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "Cuentame del proveedor", "priority": "high"},
+                               {"text": "Cuanto costo la multa", "priority": "medium"}])
+    asked_key = ui.queue.ranked_questions()[0]["key"]
+    ui.mark_asked(asked_key)
+    dismissed_key = ui.queue.top_pending_question()["key"]
+    ui.mark_dismissed(dismissed_key)
+    kinds = [e for e, _ in events]
+    assert kinds == ["question_asked", "question_dismissed"]
+    asked = events[0][1]
+    assert asked["key"] == asked_key and "proveedor" in asked["text"]
+    assert {"priority", "score"} <= set(asked)
+    dismissed = events[1][1]
+    assert dismissed["key"] == dismissed_key and "multa" in dismissed["text"]
+    assert ui.queue.questions[asked_key]["status"] == "asked"
+    assert ui.queue.questions[dismissed_key]["status"] == "dismissed"
+    # repeating a transition is a no-op: no duplicate lifecycle events
+    ui.mark_asked(asked_key)
+    ui.mark_dismissed(dismissed_key)
+    assert [e for e, _ in events] == kinds
+
+
+def test_dismissed_question_never_pending_nor_shown_again():
+    """Dismissal removes the question from pending views for good: no
+    top_pending_question, no ranked pending entry, no question_shown — even
+    when the same text recurs."""
+    ui, events = event_ui()
+    ui.queue.ingest(questions=[{"text": "unica pregunta", "priority": "high"}])
+    key = ui.queue.top_pending_question()["key"]
+    ui.mark_dismissed(key)
+    assert ui.queue.top_pending_question() is None
+    assert [q["key"] for q in ui.queue.pending_questions()] == []
+    ui.queue.ingest(questions=[{"text": "unica pregunta", "priority": "high"}])
+    assert ui.queue.top_pending_question() is None
+    assert [q["key"] for q in ui.queue.pending_questions()] == []
+    tui.build_layout(ui, 100, 24)
+    assert [p for e, p in events if e == "question_shown"] == []

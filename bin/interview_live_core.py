@@ -6,11 +6,15 @@ Responsibilities:
     mention counts (recurrence raises priority); questions dedupe by normalized
     text and merge paraphrases of the same pending question by token overlap
   - Rank items so the dashboard shows "what matters right now" first
+  - Track question lifecycle status (pending / asked / dismissed) and a
+    first-render `shown` flag so events fire exactly once per question
 Rationale: canticos-c02 — the reactive TUI needs a small, unit-testable model
   decoupled from ffmpeg/whisper/pi subprocesses and from curses rendering. Tests
   import this module directly; the script and the TUI both share this one queue.
   canticos-4pi — exact-key dedupe fragmented the queue under paraphrase storms;
   token-set Jaccard (after a light es normalization) folds variants together.
+  canticos-vvc — question lifecycle events need a status API and a shown flag
+  here, where transitions happen, so TUI and plain mode share one truth.
 """
 
 import json
@@ -198,7 +202,7 @@ class Queue:
             if cur is None:
                 cur = {"key": key, "text": text, "priority": prio,
                        "mentions": 1, "added_at": now, "last_seen": now,
-                       "status": "pending", "score": 0}
+                       "status": "pending", "shown": False, "score": 0}
                 self.questions[key] = cur
             else:
                 cur["mentions"] += 1
@@ -242,17 +246,45 @@ class Queue:
                           key=lambda q: (0 if q["status"] == "pending" else 1,
                                          -q["score"], -q["last_seen"], q["text"]))
 
-    def top_pending_question(self):
-        for q in self.ranked_questions():
-            if q["status"] == "pending":
-                return q
-        return None
+    def pending_questions(self):
+        """Ranked pending view: asked and dismissed questions never appear.
+        canticos-vvc — lifecycle status is the single source of truth for what
+        the interviewer can still act on."""
+        return [q for q in self.ranked_questions() if q["status"] == "pending"]
 
-    def mark_asked(self, key):
+    def top_pending_question(self):
+        pending = self.pending_questions()
+        return pending[0] if pending else None
+
+    def mark_shown(self, key):
+        """Flag a question as rendered and return a snapshot on that first flip
+        only. Repeated frames, asked and dismissed questions return None (the
+        question_shown event must fire exactly once per question lifetime)."""
         with self._lock:
             q = self.questions.get(key)
-            if q:
-                q["status"] = "asked"
+            if not q or q["status"] != "pending" or q.get("shown"):
+                return None
+            q["shown"] = True
+            return dict(q)
+
+    def _transition(self, key, status):
+        """Set a lifecycle status; return a snapshot only when it changed, so
+        repeated calls never emit duplicate transition events."""
+        with self._lock:
+            q = self.questions.get(key)
+            if not q or q["status"] == status:
+                return None
+            q["status"] = status
+            return dict(q)
+
+    def mark_asked(self, key):
+        """Mark asked; returns the question snapshot when it transitioned."""
+        return self._transition(key, "asked")
+
+    def mark_dismissed(self, key):
+        """Dismiss (canticos-vvc): kept in the snapshot for the audit trail but
+        out of every pending view, and it never re-emits as shown."""
+        return self._transition(key, "dismissed")
 
     def snapshot(self, participants=None, updated_at=None):
         """Serializable state, written to queue.json for archival/debug."""

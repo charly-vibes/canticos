@@ -3,7 +3,8 @@
 Responsibilities:
   - Emit typed events (session_start, capture_start, transcript_segment,
     whisper_error, suggest_trigger, suggest_stale_drop, suggest_result,
-    suggest_error, participants_set, session_end) as one JSON object per line,
+    suggest_error, question_shown, question_asked, question_dismissed,
+    participants_set, session_end) as one JSON object per line,
     in wall-clock order, with ts/seq metadata
   - Append (never truncate) so a session survives crashes and replays cleanly
   - Serialize writes with a lock: the TUI worker thread and the main thread both emit

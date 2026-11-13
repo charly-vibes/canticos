@@ -2,6 +2,9 @@
 
 ## 2026-11-13
 
+### Added
+- `interview-live`: **question lifecycle events** (canticos-vvc) — `question_shown` fires the first frame a pending question enters the rendered view (TUI queue pane or a plain stdout round), exactly once per question lifetime; `question_asked` on the existing space/`mark_asked` path; `question_dismissed` via the new `Queue.mark_dismissed` (API only until a TUI key binds it). Payloads carry `key`/`text`/`priority`/`score`. The queue now tracks `status` + a `shown` flag and exposes `pending_questions()`, so asked/dismissed questions never re-enter pending views or re-emit as shown. `TuiState` takes an injectable `emit` sink (default no-op) so layout tests need no EventLog; the coordinator wires `self.log.emit`. Tests: 5 new (4 unit, 1 fake-pi e2e).
+
 ### Changed
 - `interview-live`: **conversation-driven suggestion cadence** (canticos-2iv) — new pure `bin/interview_live_trigger.py` (`TriggerPolicy`, injected clock) replaces the per-round enqueue: batches now fire on guest turn end (1.2s quiet floor P-01, verdict in audio time or wall clock), on a guest monologue cap (25s P-02), on the TUI `f` force key, or on the end-of-run flush — so cadence follows the interview instead of the `--every` timer. The suggester thread drops stale queued batches when a newer one is pending but carries their lines into the newest batch (no segment loss), logging `suggest_trigger` / `suggest_stale_drop` events. Tests: 7 new (`-k trigger`), including a stale-drop integration run proving 8 triggers coalesce into 2 pi calls with every transcript line preserved.
 
