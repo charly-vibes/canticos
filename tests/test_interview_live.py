@@ -781,6 +781,9 @@ def test_plain_pi_output_fallback(env):
     rec.write_bytes(b"fake-audio")
     r = run(env, "--from", str(rec))
     assert r.returncode == 0, r.stderr
+    # canticos-wrl: the stdout view is the NEXT card, not the raw pi lines
+    assert "ASK NOW" in r.stdout and "Backlog:" in r.stdout
+    assert "Q1: Tell me more" not in r.stdout
     q = [f for f in out_files(env, ".md") if "questions" in f.name]
     assert q and "supplier problem" in q[0].read_text()
     # plain mode also writes a queue file with no topics
@@ -1287,6 +1290,26 @@ def test_plain_mode_emits_question_shown(env):
         assert e["priority"] in ("high", "medium", "low")
     assert len(shown) == len({e["key"] for e in shown}), "question_shown re-emitted"
     assert not [e for e in lines if e["type"] == "question_asked"]
+
+
+def test_plain_mode_prints_lead_card_and_backlog_not_raw_pi(env):
+    """canticos-wrl: stdout parity with the TUI — per suggestion batch print
+    the ASK NOW lead card (question + grounds quote + [MM:SS]) and the
+    following backlog; never the raw pi output dump."""
+    rec = Path(env['HOME']) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run({**env, "PI_MODE": "json"}, "--from", str(rec))
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "ASK NOW" in out
+    assert "Tell me more about the supplier problem" in out
+    assert "tuvimos un problema con el proveedor" in out
+    assert re.search(r"ASK NOW \[\d\d:\d\d\]", out), out
+    assert "Backlog:" in out
+    assert "What did you do differently" in out
+    # raw pi payloads stay out of the transcript stream
+    assert '"questions"' not in out and '"topics"' not in out
+    assert '{"questions"' not in out
 
 
 # -- question model (canticos-7h9) --------------------------------------------

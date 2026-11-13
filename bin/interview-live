@@ -79,8 +79,14 @@ class InterviewLive:
         self.recent_lines = deque(maxlen=sug.RECENT_WINDOW_LINES)
         self._recent_lock = threading.Lock()  # worker appends, suggester snapshots
         self.ui = None  # tui.TuiState when the dashboard is active
+        # Plain stdout parity (canticos-wrl): the lead card's dwell/hysteresis
+        # bookkeeping lives in a TuiState even without curses, so batches share
+        # one stable NEXT recommendation.
+        self.board_ui = tui.TuiState(queue=self.queue)
         self.log = evlog.EventLog(self.events_path)
         self.started_at = time.time()
+        self.board_ui.started = self.started_at
+        self.board_ui.participants = args.participants
 
     def _load_speaker_names(self, specs):
         """Merge speakers.json with --speaker specs; persist when specs are
@@ -331,8 +337,13 @@ class InterviewLive:
         if self.ui:
             self.ui.suggestion = "done (fallback)" if degraded else "done"
         else:
-            sys.stdout.write(f"\n--- follow-up questions ({time.strftime('%H:%M:%S')}) ---\n{out}\n\n")
+            # canticos-wrl plain parity: lead card + grounds + [MM:SS] +
+            # three-item backlog — never the raw pi output dump.
+            now = time.time()
             self._emit_shown()
+            self.board_ui.participants = self.participants
+            board = tui.render_plain_board(self.board_ui, now=now)
+            sys.stdout.write(f"\n--- follow-up questions ({time.strftime('%H:%M:%S')}) ---{board}\n")
 
     def _reject(self, reasons, failure):
         """The single repair round still broke the contract (or pi failed on

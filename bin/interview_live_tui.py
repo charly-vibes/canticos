@@ -2,17 +2,23 @@
 """Purpose: Reactive curses dashboard for interview-live.
 Responsibilities:
   - Ask how many participants are in the conversation at session start
-  - Render a live transcript pane and a prioritized queue pane (pi questions
-    + important topics with recurrence counts)
-  - Observe-only by default: nothing required from the user; optional keys
-    (q quit, space mark top question asked, f ask now, PgUp/PgDn scroll transcript)
+  - Render a live transcript pane plus a three-zone NEXT pane: an ASK NOW lead
+    card (best pending question + grounds quote + [MM:SS]), a compact backlog of
+    the following pending questions with j/k selection, and the topics strip
+  - Keep the lead card stable: minimum dwell 8 s and only swap for a challenger
+    scoring HYSTERESIS above the current card (pure function of ui state + now)
+  - Keys: q quit, a/space ask selected, d dismiss selected, j/k select,
+    f ask now, PgUp/PgDn scroll the transcript
   - Emit question lifecycle events (question_shown / question_asked /
     question_dismissed) through an injectable sink (canticos-vvc)
 Rationale: canticos-c02 — an interviewing copilot is a dashboard you glance at,
-  not a form you fill. build_layout() is kept pure (no curses) so the layout
-  logic is unit-testable; curses is imported lazily so plain/pipe mode never
-  depends on ncurses. canticos-vvc — the sink defaults to a no-op so the purity
-  of layout tests survives while the coordinator wires the real EventLog.
+  not a form you fill. canticos-wrl — one mixed ranked backlog forced a
+  space-press every ~8.5 s in the baseline session; the NEXT card turns the
+  dashboard into a recommendation instead of a triage list. build_layout() is
+  kept pure (no curses) so the layout logic is unit-testable; curses is
+  imported lazily so plain/pipe mode never depends on ncurses. canticos-vvc —
+  the sink defaults to a no-op so the purity of layout tests survives while the
+  coordinator wires the real EventLog.
 """
 
 import sys
@@ -25,6 +31,24 @@ except ImportError:  # pragma: no cover - plain mode must not need ncurses
 
 import interview_live_core as core
 from interview_live_core import fmt_ms  # noqa: E402 — single shared definition
+
+# NEXT-card tuning (canticos-wrl). The lead card is a recommendation that must
+# not churn: it survives at least LEAD_DWELL_S and a challenger must beat it by
+# more than LEAD_HYSTERESIS to take over.
+LEAD_DWELL_S = 8.0
+LEAD_HYSTERESIS = 0.10
+BACKLOG_MAX = 5          # 3-5 rows once enough pending questions exist
+PLAIN_BACKLOG = 3        # stdout parity: lead card + three following questions
+DWELL_S = LEAD_DWELL_S   # short aliases for tests/callers spelling either name
+HYSTERESIS = LEAD_HYSTERESIS
+
+
+def fmt_mmss(ms):
+    """[MM:SS] card timestamp; hours only appear once the session passes 1 h."""
+    s = max(0, int(ms)) // 1000
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
 def available():
@@ -65,6 +89,11 @@ class TuiState:
         self.force_request = False    # canticos-2iv: 'f' asks pi for a round now
         self.speaker_names = speaker_names or {}  # canticos-uzv: id -> {"name"}
         self.emit = emit or _noop_emit  # canticos-vvc: event sink (EventLog.emit)
+        # NEXT card (canticos-wrl): lead-bookkeeping lives here so the layout
+        # stays deterministic across frames, plus the backlog selection index.
+        self.lead_key = None
+        self.lead_since = None
+        self.selection = 0
 
     def expire_stale(self, now=None):
         """Retire stale pending questions (canticos-q9j) and emit one
@@ -91,12 +120,105 @@ class TuiState:
         return q
 
     def mark_dismissed(self, key):
-        """Dismiss transition for the future 'd' binding: queue status plus the
-        question_dismissed event."""
+        """Dismiss transition for the 'd' binding: queue status plus the
+        question_dismissed event (negative feedback for the ranker)."""
         q = self.queue.mark_dismissed(key)
         if q:
             emit_question(self.emit, "question_dismissed", q)
         return q
+
+    # -- NEXT card ---------------------------------------------------------
+    def select_lead(self, now=None, pending=None):
+        """Stable ASK NOW question: highest-score pending, kept for at least
+        LEAD_DWELL_S and replaced only when a challenger beats it by more than
+        LEAD_HYSTERESIS. Mutates only the lead bookkeeping, so repeated calls
+        with the same state + clock are deterministic."""
+        now = now if now is not None else time.time()
+        pending = self.queue.pending_questions() if pending is None else pending
+        if not pending:
+            self.lead_key = None
+            self.lead_since = now
+            return None
+        by_key = {q["key"]: q for q in pending}
+        lead = by_key.get(self.lead_key)
+        if lead is None:
+            lead = pending[0]
+            self.lead_key = lead["key"]
+            self.lead_since = now
+            return lead
+        challenger = next((q for q in pending if q["key"] != lead["key"]), None)
+        dwelled = now - (self.lead_since if self.lead_since is not None else now) >= LEAD_DWELL_S
+        if (dwelled and challenger is not None
+                and challenger["score"] > lead["score"] + LEAD_HYSTERESIS):
+            self.lead_key = challenger["key"]
+            self.lead_since = now
+            return challenger
+        return lead
+
+    def backlog_questions(self, pending=None):
+        """The 3-5 pending questions following the lead card (the lead itself is
+        the ASK NOW card, not a backlog row)."""
+        pending = self.queue.pending_questions() if pending is None else pending
+        lead_key = self.lead_key
+        if lead_key is None and pending:
+            lead_key = pending[0]["key"]
+        return [q for q in pending if q["key"] != lead_key][:BACKLOG_MAX]
+
+    def selectable_questions(self, pending=None):
+        """Selection domain: the lead card first (index 0, so a/space without
+        moving asks the ASK NOW recommendation, matching v1 space) followed by
+        the backlog rows."""
+        pending = self.queue.pending_questions() if pending is None else pending
+        if not pending:
+            return []
+        lead_key = self.lead_key
+        lead = next((q for q in pending if q["key"] == lead_key), pending[0])
+        return [lead] + [q for q in pending if q["key"] != lead["key"]][:BACKLOG_MAX]
+
+    def clamp_selection(self, pending=None):
+        n = len(self.selectable_questions(pending=pending))
+        self.selection = min(self.selection, n - 1) if n else 0
+        if self.selection < 0:
+            self.selection = 0
+        return self.selection
+
+    def selected_question(self, pending=None):
+        """Selected question (lead at index 0, then backlog rows); None when
+        nothing is pending."""
+        selectable = self.selectable_questions(pending=pending)
+        if not selectable:
+            self.selection = 0
+            return None
+        self.selection = min(max(0, self.selection), len(selectable) - 1)
+        return selectable[self.selection]
+
+    def move_selection(self, delta):
+        """j/k selection across the lead card and backlog; clamped, a no-op
+        when nothing is pending."""
+        selectable = self.selectable_questions()
+        if not selectable:
+            self.selection = 0
+            return 0
+        self.selection = min(max(0, self.selection + delta), len(selectable) - 1)
+        return self.selection
+
+    def ask_selected(self):
+        """Ask the selected backlog question (a/space). Empty backlog -> None."""
+        q = self.selected_question()
+        if not q:
+            return None
+        asked = self.mark_asked(q["key"])
+        self.clamp_selection()
+        return asked
+
+    def dismiss_selected(self):
+        """Dismiss the selected backlog question (d). Empty backlog -> None."""
+        q = self.selected_question()
+        if not q:
+            return None
+        dismissed = self.mark_dismissed(q["key"])
+        self.clamp_selection()
+        return dismissed
 
 
 def _clip(text, width):
@@ -110,15 +232,29 @@ def _clip(text, width):
     return text[: width - 3] + "..."
 
 
+def _prio_mark(priority):
+    return "*" if priority == "high" else ("+" if priority == "medium" else "-")
+
+
+def _lead_stamp(ui, q):
+    """[MM:SS] arrival timestamp of the question relative to session start."""
+    return fmt_mmss((q.get("added_at", ui.started) - ui.started) * 1000)
+
+
 def build_layout(ui, width, height, scroll=0, now=None):
     """No curses and no direct I/O — unit-testable.
 
-    Returns a dict with header / transcript / queue / footer line lists and the
-    transcript scroll position. Side effects, both through ui.emit (no-op by
-    default): stale pending questions are expired (question_dismissed with
-    reason='expired', canticos-q9j) and pending questions entering the queue
-    pane emit question_shown. Rendering (colors, cursor) is an orthagonal,
-    untested thin layer in draw().
+    Returns header / transcript / lead / backlog / topics / footer zones plus
+    the transcript scroll position and backlog selection. The right pane is the
+    canticos-wrl three-zone NEXT card: ASK NOW (one stable lead question with
+    its grounds quote and [MM:SS]), BACKLOG (the following pending questions
+    with a j/k selection index) and TOPICS (unchanged rendering).
+
+    Side effects, both through ui.emit (no-op by default): stale pending
+    questions are expired (question_dismissed with reason='expired',
+    canticos-q9j) and pending questions rendered in the lead/backlog emit
+    question_shown. Rendering (colors, cursor) is an orthogonal, untested thin
+    layer in draw().
     """
     now = now if now is not None else time.time()
     width = max(width, 30)
@@ -150,43 +286,112 @@ def build_layout(ui, width, height, scroll=0, now=None):
     ]
     scroll = len(ui.transcript) - cap  # clamp scroll to available history
 
-    # --- priority queue pane ----------------------------------------------
-    cap_q = max(0, main_h - 1)
-    entries = []  # (kind, priority_mark, text, status, priority)
-    pending_rendered = []  # canticos-vvc: pending questions in this frame's view
+    # --- NEXT card: ASK NOW lead + backlog + topics ------------------------
     ui.expire_stale(now)  # canticos-q9j: retire stale questions before rendering
-    for q in ui.queue.ranked_questions():
-        if q["status"] == "expired":
-            continue  # dismissed for good; the audit trail stays in queue.json
-        mark = "*" if q["priority"] == "high" else ("+" if q["priority"] == "medium" else "-")
-        prefix = "[x] " if q["status"] == "asked" else f"{mark} "
-        entries.append(("Q", prefix + q["text"], q["status"], q["priority"]))
-        if q["status"] == "pending":
-            pending_rendered.append(q)
+    pending = ui.queue.pending_questions()
+    lead = ui.select_lead(now, pending)
+    backlog_qs = ui.backlog_questions(pending=pending)
+    ui.clamp_selection(pending=pending)
+
+    lead_zone = {"key": None, "text": "", "grounds": "", "timestamp": "",
+                 "priority": None, "score": None, "lines": []}
+    shown_qs = []
+    if lead is None:
+        lead_zone["lines"] = [_clip("ASK NOW - no pending question", width)]
+    else:
+        stamp = _lead_stamp(ui, lead)
+        grounds = (lead.get("grounds") or "").strip()
+        cursor = ">" if ui.selection == 0 else " "
+        lines = [f"ASK NOW [{stamp}]",
+                 _clip(f"{cursor} {_prio_mark(lead['priority'])} {lead['text']}",
+                       width)]
+        if grounds:
+            lines.append(_clip(f"  > {grounds}", width))
+        lead_zone = {
+            "key": lead["key"], "text": lead["text"], "grounds": grounds,
+            "timestamp": stamp, "priority": lead["priority"],
+            "score": lead["score"], "lines": [_clip(l, width) for l in lines],
+        }
+        shown_qs.append(lead)
+
+    backlog = []
+    for i, q in enumerate(backlog_qs):
+        selected = i + 1 == ui.selection  # index 0 is the lead card
+        text = _clip(("> " if selected else "  ") + f"{i + 1}. "
+                     f"{_prio_mark(q['priority'])} {q['text']}", width)
+        backlog.append({"key": q["key"], "text": q["text"], "index": i,
+                        "selected": selected, "priority": q["priority"],
+                        "score": q["score"], "status": q["status"], "line": text})
+        shown_qs.append(q)
+
+    topics = []
     for t in ui.queue.ranked_topics():
-        mark = "*" if t["priority"] == "high" else ("+" if t["priority"] == "medium" else "-")
-        entries.append(("T", f"{mark} {t['name']} x{t['mentions']}", "topic", t["priority"]))
-    queue = [e for e in entries[:cap_q]]
-    # Pending questions sort first, so the pane's first cap_q rows are exactly
-    # pending_rendered[:cap_q]; expiry + shown emits are build_layout's only
-    # side effects.
-    for q in pending_rendered[:cap_q]:
+        topics.append({"name": t["name"], "mentions": t["mentions"],
+                       "priority": t["priority"],
+                       "line": _clip(f"{_prio_mark(t['priority'])} {t['name']} "
+                                     f"x{t['mentions']}", width)})
+
+    right = [("lead" if i == 0 else "card", line)
+             for i, line in enumerate(lead_zone["lines"])]
+    if backlog:
+        right.append(("title", "BACKLOG"))
+        right.extend(("selected" if e["selected"] else "backlog", e["line"])
+                     for e in backlog)
+    if topics:
+        right.append(("title", "TOPICS"))
+        right.extend(("topic", t["line"]) for t in topics)
+    right = right[:max(0, main_h - 1)]
+
+    # The lead card and the visible backlog rows are exactly the rendered
+    # pending questions; asked/dismissed/expired never reach these zones.
+    for q in shown_qs:
         ui.note_shown(q, now)
 
-    footer = _clip(
-        "q quit | space: mark top question asked | f: ask now | PgUp/PgDn: scroll",
-        width,
-    )
+    hint = ("q quit | j/k select | a/space ask selected | d dismiss selected "
+            "| f ask now | PgDn scrolls (not dismiss)")
+    if width < 70:  # keep the d/PgDn hint visible in a narrow terminal
+        hint = "j/k sel a/space ask d dismiss PgDn scroll q quit"
+    footer = _clip(hint, width)
 
     return {
         "width": width,
         "height": height,
         "header": header,
         "transcript": transcript,
-        "queue": queue,
+        "lead": lead_zone,
+        "backlog": backlog,
+        "topics": topics,
+        "right": right,
+        "selection": ui.selection,
         "footer": footer,
         "scroll": scroll,
     }
+
+
+def render_plain_board(ui, now=None, backlog_limit=PLAIN_BACKLOG):
+    """Plain stdout parity for the NEXT card (canticos-wrl): lead question with
+    its grounds quote and [MM:SS], then a compact following backlog. No JSON,
+    no raw pi dump. Shares TuiState lead bookkeeping so dwell/hysteresis apply
+    across batches exactly as in the dashboard."""
+    now = now if now is not None else time.time()
+    pending = ui.queue.pending_questions()
+    lead = ui.select_lead(now, pending)
+    following = ui.backlog_questions(pending=pending)[:backlog_limit]
+    lines = ["", "--- next question ---"]
+    if lead is None:
+        lines.append("ASK NOW - no pending question")
+    else:
+        stamp = _lead_stamp(ui, lead)
+        lines.append(f"ASK NOW [{stamp}] {lead['text']}")
+        grounds = (lead.get("grounds") or "").strip()
+        if grounds:
+            lines.append(f"  > {grounds}")
+    lines.append("Backlog:")
+    if following:
+        lines.extend(f"  {i}. {q['text']}" for i, q in enumerate(following, 1))
+    else:
+        lines.append("  (empty)")
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -251,20 +456,22 @@ def draw(stdscr, layout):
             pair = curses.color_pair(2 if spk == 0 else 3)
             stdscr.addnstr(y, 0, line, left_w, pair)
             y += 1
-        # priority queue (right column)
+        # NEXT card zones (right column): ASK NOW lead, backlog, topics
         x = left_w + 1
         if x < w:
-            try:
-                stdscr.addnstr(2, x, "PRIORITY QUEUE", w - x, curses.color_pair(4) | curses.A_BOLD)
-            except curses.error:
-                pass
-            qy = 3
-            for kind, text, status, prio in layout["queue"]:
+            qy = 2
+            for kind, text in layout["right"]:
                 if qy >= h - 1:
                     break
-                if status == "asked":
-                    pair = curses.color_pair(6)
-                elif kind == "Q" and prio == "high":
+                if kind == "title":
+                    pair = curses.color_pair(4) | curses.A_BOLD
+                elif kind == "lead":
+                    pair = curses.color_pair(5) | curses.A_BOLD
+                elif kind == "selected":
+                    pair = curses.color_pair(5) | curses.A_BOLD
+                elif kind == "topic":
+                    pair = curses.color_pair(1)  # topics unchanged (canticos-6ic)
+                elif kind == "card" and layout["lead"]["priority"] == "high":
                     pair = curses.color_pair(5)
                 else:
                     pair = curses.color_pair(1)
@@ -277,6 +484,27 @@ def draw(stdscr, layout):
     except curses.error:
         pass
     stdscr.refresh()
+
+
+def handle_key(ui, ch, scroll):
+    """One dashboard key, curses-free so it is unit-testable. Returns the new
+    transcript scroll. All backlog actions are no-ops when the backlog is
+    empty; 'd' is dismissal now, never PgDn (PgDn still scrolls)."""
+    if ch in (ord("a"), ord(" ")):
+        ui.ask_selected()
+    elif ch == ord("d"):
+        ui.dismiss_selected()
+    elif ch == ord("j"):
+        ui.move_selection(1)
+    elif ch == ord("k"):
+        ui.move_selection(-1)
+    elif ch == ord("f"):
+        ui.force_request = True   # trigger a suggestion round now
+    elif ch in (getattr(curses, "KEY_PPAGE", -1), ord("u")):
+        scroll += 6
+    elif ch == getattr(curses, "KEY_NPAGE", -1):
+        scroll = max(0, scroll - 6)
+    return scroll
 
 
 def run_dashboard(stdscr, ui, participants_default, stop_check=lambda: False):
@@ -298,18 +526,7 @@ def run_dashboard(stdscr, ui, participants_default, stop_check=lambda: False):
             ch = -1
         if ch in (ord("q"), 3):
             break
-        elif ch == ord(" "):
-            top = ui.queue.top_pending_question()
-            if top:
-                ui.mark_asked(top["key"])
-        elif ch == ord("f"):
-            ui.force_request = True   # trigger a suggestion round now
-        elif ch in (curses.KEY_PPAGE, ord("u")):
-            scroll += 6
-        elif ch in (curses.KEY_NPAGE, ord("d")):
-            scroll = max(0, scroll - 6)
-        elif ch == curses.KEY_RESIZE:
-            pass
+        scroll = handle_key(ui, ch, scroll)
         h, w = stdscr.getmaxyx()
         layout = build_layout(ui, w, h, scroll=scroll)
         draw(stdscr, layout)

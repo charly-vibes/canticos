@@ -152,31 +152,201 @@ def test_layout_shows_participant_cap_hint_for_many():
     assert any("Guests(3):" in t for _, t in lay["transcript"])
 
 
-def test_layout_queue_shows_questions_and_topics_sorted():
+def _right_lines(lay):
+    return "\n".join(line for _, line in lay["right"])
+
+
+def test_layout_three_zones_lead_backlog_topics():
+    """canticos-wrl: the pane is ASK NOW + backlog + topics, not one mixed
+    ranked list. The lead is the best pending question; the backlog holds the
+    following ones; topics render as before."""
     ui = make_ui()
+    ui.queue.ingest(questions=[
+        {"text": "Como elegiste a ese proveedor", "priority": "medium"},
+        {"text": "Que paso con el contrato firmado", "priority": "medium"},
+        {"text": "Cuanto tiempo duro la negociacion", "priority": "medium"},
+        {"text": "Quien aprobo el presupuesto extra", "priority": "medium"},
+        {"text": "Que aprendiste para la proxima compra", "priority": "medium"},
+    ])
     ui.queue.ingest(topics=[{"name": "proveedor", "priority": "high", "note": ""}])
     lay = tui.build_layout(ui, 100, 24)
-    qtext = "\n".join(t for _, t, _, _ in lay["queue"])
-    assert "Cuentame mas del problema del proveedor" in qtext
-    assert "Proveedor" in qtext and "x2" in qtext
+    assert "queue" not in lay, "mixed ranked list must be gone"
+    lead = "\n".join(lay["lead"]["lines"])
+    assert "ASK NOW" in lead
+    assert "Cuentame mas del problema del proveedor" in lead
+    assert len(lay["backlog"]) == 5  # 6 pending -> lead + 5 following
+    assert all(e["key"] != lay["lead"]["key"] for e in lay["backlog"])
+    assert "BACKLOG" in _right_lines(lay) and "TOPICS" in _right_lines(lay)
+    topics = "\n".join(t["line"] for t in lay["topics"])
+    assert "Proveedor" in topics and "x2" in topics
 
 
-def test_layout_truncates_to_width():
+def test_layout_truncates_every_zone_to_52_columns():
     ui = make_ui()
+    ui.queue.ingest(questions=[
+        {"text": f"pregunta larga numero {i} " + "y" * 120, "priority": "medium"}
+        for i in range(6)
+    ])
     ui.transcript.append((13000, 1, "x" * 300))
-    lay = tui.build_layout(ui, 60, 12)
+    lay = tui.build_layout(ui, 52, 24)
+    for line in lay["header"]:
+        assert len(line) <= 52
     for _, line in lay["transcript"]:
-        assert len(line) <= 60
-    assert lay["footer"]  # footer present even in small terminal
+        assert len(line) <= 52
+    for line in lay["lead"]["lines"]:
+        assert len(line) <= 52
+    for entry in lay["backlog"]:
+        assert len(entry["line"]) <= 52
+    for topic in lay["topics"]:
+        assert len(topic["line"]) <= 52
+    for _, line in lay["right"]:
+        assert len(line) <= 52
+    assert lay["footer"]  # footer present even in a narrow terminal
 
 
-def test_layout_mark_asked_renders_prefix():
-    ui = make_ui()
-    top = ui.queue.top_pending_question()
-    ui.queue.mark_asked(top["key"])
-    lay = tui.build_layout(ui, 100, 24)
-    qlines = [t for _, t, s, _ in lay["queue"]]
-    assert any(l.startswith("[x]") for l in qlines)
+def test_layout_lead_card_has_grounds_quote_and_mmss():
+    ui = tui.TuiState()
+    ui.started = 100.0
+    ui.queue.ingest(questions=[{"text": "Cuentame del proveedor",
+                                "priority": "high",
+                                "grounds": "tuvimos un problema con el proveedor"}],
+                    now=230.0)
+    lay = tui.build_layout(ui, 100, 24, now=230.0)
+    card = "\n".join(lay["lead"]["lines"])
+    assert "02:10" in card
+    assert "tuvimos un problema con el proveedor" in card
+    assert lay["lead"]["timestamp"] == "02:10"
+    assert lay["lead"]["grounds"] == "tuvimos un problema con el proveedor"
+
+
+def test_lead_card_dwell_8s_before_challenger_swap():
+    """The ASK NOW card keeps its question for at least 8 s even when a much
+    better challenger appears."""
+    ui = tui.TuiState()
+    ui.started = 100.0
+    ui.queue.ingest(questions=[{"text": "primera pregunta alta", "priority": "high"}],
+                    now=100.0)
+    lay = tui.build_layout(ui, 100, 24, now=100.0)
+    first = lay["lead"]["key"]
+    ui.queue.ingest(questions=[{"text": "segunda pregunta distinta",
+                                "priority": "high"}], now=101.0)
+    second = next(q["key"] for q in ui.queue.pending_questions() if q["key"] != first)
+    ui.queue.questions[second]["score"] = 150.0
+    lay = tui.build_layout(ui, 100, 24, now=104.0)  # 4 s dwell
+    assert lay["lead"]["key"] == first
+    lay = tui.build_layout(ui, 100, 24, now=108.5)  # 8.5 s dwell
+    assert lay["lead"]["key"] == second
+
+
+def test_lead_card_hysteresis_requires_margin_over_010():
+    """A challenger with a slightly higher score cannot take the card; it needs
+    to beat the current card by more than 0.10."""
+    ui = tui.TuiState()
+    ui.started = 100.0
+    ui.queue.ingest(questions=[{"text": "pregunta estable alta", "priority": "high"}],
+                    now=100.0)
+    first = tui.build_layout(ui, 100, 24, now=100.0)["lead"]["key"]
+    ui.queue.ingest(questions=[{"text": "retadora distinta", "priority": "high"}],
+                    now=101.0)
+    second = next(q["key"] for q in ui.queue.pending_questions() if q["key"] != first)
+    ui.queue.questions[second]["score"] = 100.05  # margin below 0.10
+    for now in (108.5, 110.0, 115.0):
+        assert tui.build_layout(ui, 100, 24, now=now)["lead"]["key"] == first
+    ui.queue.questions[second]["score"] = 100.11  # now beats by > 0.10
+    assert tui.build_layout(ui, 100, 24, now=116.0)["lead"]["key"] == second
+
+
+def _backlog_ui():
+    """Lead q1 + four following backlog rows; the lead is established by the
+    first build_layout call, exactly as the dashboard runs."""
+    ui = tui.TuiState()
+    ui.started = 100.0
+    ui.queue.ingest(questions=[
+        {"text": "pregunta lead principal", "priority": "high"},
+        {"text": "pregunta siguiente uno", "priority": "medium"},
+        {"text": "pregunta siguiente dos", "priority": "medium"},
+        {"text": "pregunta siguiente tres", "priority": "medium"},
+        {"text": "pregunta siguiente cuatro", "priority": "medium"},
+    ], now=100.0)
+    tui.build_layout(ui, 100, 24, now=100.0)
+    return ui
+
+
+def test_jk_moves_selection_across_lead_and_backlog_and_clamps():
+    ui = _backlog_ui()
+    assert ui.selection == 0
+    assert len(ui.backlog_questions()) == 4  # lead + 4 following
+    tui.handle_key(ui, ord("j"), 0)
+    assert ui.selection == 1
+    tui.handle_key(ui, ord("k"), 0)
+    assert ui.selection == 0
+    tui.handle_key(ui, ord("k"), 0)
+    assert ui.selection == 0
+    for _ in range(10):
+        tui.handle_key(ui, ord("j"), 0)
+    assert ui.selection == len(ui.selectable_questions()) - 1
+
+
+def test_space_and_a_ask_the_selected_question():
+    events = []
+    ui = _backlog_ui()
+    ui.emit = lambda etype, **p: events.append((etype, p))
+    lead = ui.selectable_questions()[0]  # index 0 is the ASK NOW card
+    scroll = tui.handle_key(ui, ord(" "), 0)
+    assert scroll == 0
+    assert ui.queue.questions[lead["key"]]["status"] == "asked"
+    assert [e for e, _ in events] == ["question_asked"]
+    assert events[0][1]["key"] == lead["key"]
+
+    tui.build_layout(ui, 100, 24, now=100.0)
+    following = ui.backlog_questions()[0]
+    tui.handle_key(ui, ord("j"), 0)  # move off the lead onto the first backlog row
+    tui.handle_key(ui, ord("a"), 0)
+    assert ui.queue.questions[following["key"]]["status"] == "asked"
+    assert [e for e, _ in events] == ["question_asked", "question_asked"]
+
+
+def test_d_dismisses_selected_and_emits_question_dismissed():
+    events = []
+    ui = _backlog_ui()
+    ui.emit = lambda etype, **p: events.append((etype, p))
+    tui.handle_key(ui, ord("j"), 0)
+    selected = ui.backlog_questions()[0]
+    scroll = tui.handle_key(ui, ord("d"), 30)
+    assert scroll == 30, "d must not scroll (PgDn keeps scrolling)"
+    assert ui.queue.questions[selected["key"]]["status"] == "dismissed"
+    assert [e for e, _ in events] == ["question_dismissed"]
+    assert events[0][1]["key"] == selected["key"]
+
+
+def test_empty_backlog_keys_are_noops():
+    events = []
+    ui = tui.TuiState()
+    ui.started = 100.0
+    ui.emit = lambda etype, **p: events.append((etype, p))
+    lay = tui.build_layout(ui, 100, 24, now=100.0)
+    assert lay["lead"]["key"] is None and lay["backlog"] == []
+    for ch in (ord("a"), ord(" "), ord("d"), ord("j"), ord("k")):
+        assert tui.handle_key(ui, ch, 0) == 0
+    assert ui.selection == 0
+    assert events == []
+    assert ui.queue.top_pending_question() is None
+
+
+def test_f_still_forces_a_suggestion_round():
+    ui = _backlog_ui()
+    tui.handle_key(ui, ord("f"), 0)
+    assert ui.force_request is True
+
+
+def test_pgup_pgdn_still_scroll_transcript_and_footer_hints():
+    ui = _backlog_ui()
+    assert tui.handle_key(ui, tui.curses.KEY_PPAGE, 0) == 6
+    assert tui.handle_key(ui, tui.curses.KEY_NPAGE, 12) == 6
+    assert tui.handle_key(ui, tui.curses.KEY_NPAGE, 3) == 0
+    lay = tui.build_layout(ui, 100, 24, now=100.0)
+    assert "d dismiss" in lay["footer"]
+    assert "PgDn" in lay["footer"]
 
 
 def test_layout_scroll_back_reveals_older_lines():
@@ -287,7 +457,8 @@ def test_build_layout_expires_stale_questions_and_emits_dismissed():
     key = ui.queue.top_pending_question()["key"]
     stale_now = core.expires_at(ui.queue.questions[key]) + 1.0
     lay = tui.build_layout(ui, 100, 24, now=stale_now)
-    assert not any("vieja pregunta" in text for _, text, _, _ in lay["queue"])
+    assert not any("vieja pregunta" in line for line in lay["lead"]["lines"])
+    assert not any("vieja pregunta" in e["text"] for e in lay["backlog"])
     dismissed = [p for e, p in events if e == "question_dismissed"]
     assert len(dismissed) == 1
     assert dismissed[0]["key"] == key and dismissed[0]["reason"] == "expired"
