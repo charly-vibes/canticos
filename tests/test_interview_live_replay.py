@@ -12,6 +12,7 @@ Rationale: parameter sweeps need the event log to be the single source of truth.
   system clock.
 """
 
+import datetime
 import inspect
 import json
 import subprocess
@@ -260,3 +261,143 @@ def test_cli_matches_reducer_and_is_stable():
         capture_output=True, text=True, check=True,
     )
     assert json.loads(pretty.stdout)["counts"]["segments"] == 147
+
+
+def _section(body, title):
+    """Bullet lines under one `## title` heading, stopping at the next heading."""
+    lines = body.splitlines()
+    start = lines.index(title)
+    bullets = []
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if line.strip():
+            bullets.append(line)
+    return bullets
+
+
+def _iso_utc(ts):
+    return datetime.datetime.fromtimestamp(
+        ts, datetime.timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_knowledge_entry_from_fixture_is_turu_shaped():
+    state = _reduce_fixture()
+    entries = replay.knowledge_entries(state)
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert set(entry) == {"format", "timestamp", "task", "body", "text"}
+    assert entry["format"] == 1
+    assert entry["timestamp"] == _iso_utc(state["last_ts"])
+    assert entry["task"] == "interview-live interview-20261113-084517"
+    assert entry["text"].startswith(
+        f"Format: 1\nTimestamp: {entry['timestamp']}\nTask: {entry['task']}\n"
+    )
+    assert entry["body"] in entry["text"]
+
+    pending = [q for q in state["questions"] if q["status"] == "pending"]
+    expected = [
+        f"- {q['text']} (mentions: {q['mentions']}, "
+        f"priority: {q['priority']}, score: {q['score']})"
+        for q in pending[:replay.KNOWLEDGE_TOP_QUESTIONS]
+    ]
+    assert _section(entry["body"], "## Pending questions") == expected
+    assert _section(entry["body"], "## Session") == ["- reason: interrupted"]
+
+
+def test_knowledge_ranks_topics_and_pending_questions():
+    events = [
+        {"ts": 100.0, "type": "session_start", "session": "s1", "mode": "live"},
+        {"ts": 101.0, "type": "suggest_result",
+         "questions": [
+             {"text": "low q", "priority": "low"},
+             {"text": "high q", "priority": "high"},
+         ],
+         "topics": [
+             {"name": "beta", "priority": "low"},
+             {"name": "alpha", "priority": "high"},
+         ]},
+        {"ts": 102.0, "type": "suggest_result", "questions": [],
+         "topics": [{"name": "alpha", "priority": "high"}]},
+        {"ts": 103.0, "type": "session_end", "reason": "completed"},
+    ]
+    entry = replay.knowledge_entries(replay.reduce_events(events))[0]
+
+    topics = _section(entry["body"], "## Topics")
+    assert topics[0].startswith("- alpha")
+    assert topics[1].startswith("- beta")
+    assert _section(entry["body"], "## Pending questions")[0].startswith("- high q")
+    assert _section(entry["body"], "## Session") == ["- reason: completed"]
+    assert entry["timestamp"] == _iso_utc(103.0)
+    assert entry["task"] == "interview-live s1"
+
+
+def test_knowledge_entries_are_byte_identical_across_runs():
+    first = json.dumps(
+        replay.knowledge_entries(_reduce_fixture()),
+        sort_keys=True, ensure_ascii=False,
+    )
+    second = json.dumps(
+        replay.knowledge_entries(_reduce_fixture()),
+        sort_keys=True, ensure_ascii=False,
+    )
+    assert first == second
+    assert replay.format_knowledge(replay.knowledge_entries(_reduce_fixture())) == \
+        replay.format_knowledge(replay.knowledge_entries(_reduce_fixture()))
+
+
+def test_knowledge_entries_read_only_state():
+    params = inspect.signature(replay.knowledge_entries).parameters
+    assert list(params) == ["state"]
+
+
+def test_cli_knowledge_json_array_and_human_markdown():
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), str(FIXTURE), "--knowledge", "--json"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(proc.stdout)
+    assert isinstance(data, list) and len(data) == 1
+    assert set(data[0]) == {"format", "timestamp", "task", "body", "text"}
+    assert data[0]["format"] == 1
+    assert proc.stdout.strip().startswith("[") and proc.stdout.strip().endswith("]")
+
+    human = subprocess.run(
+        [sys.executable, str(SCRIPT), str(FIXTURE), "--knowledge"],
+        capture_output=True, text=True, check=True,
+    )
+    assert human.stdout.startswith("Format: 1\nTimestamp: ")
+    assert "Task: interview-live interview-20261113-084517" in human.stdout
+    assert "## Topics" in human.stdout
+    assert "## Pending questions" in human.stdout
+    assert "reason: interrupted" in human.stdout
+
+
+def test_cli_knowledge_empty_log_yields_no_entries(tmp_path):
+    assert replay.knowledge_entries(replay.reduce_events([])) == []
+
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+
+    as_json = subprocess.run(
+        [sys.executable, str(SCRIPT), str(empty), "--knowledge", "--json"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(as_json.stdout) == []
+
+    human = subprocess.run(
+        [sys.executable, str(SCRIPT), str(empty), "--knowledge"],
+        capture_output=True, text=True, check=True,
+    )
+    assert human.stdout == ""
+
+
+def test_cli_knowledge_rejects_sweep_combination():
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), str(FIXTURE), "--knowledge", "--sweep", "{}"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "--knowledge" in proc.stderr
