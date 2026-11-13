@@ -48,6 +48,8 @@ def test_golden_fixture_values():
     assert metrics["question_topic_ratio_overall"] == pytest.approx(101 / 44)
     assert metrics["topic_only_batches"] == 0
     assert metrics["topic_only_pct"] == pytest.approx(0.0)
+    assert metrics["no_question_batches"] == 3  # three empty (questions:null) batches
+    assert metrics["no_question_pct"] == pytest.approx(3 / 31 * 100.0)
     assert metrics["median_cadence_seconds"] == pytest.approx(21.13028860092163)
     assert metrics["time_to_first_question_seconds"] == pytest.approx(27.433213472366333)
     assert metrics["questions_per_min"] == pytest.approx(1.209053399436663)
@@ -68,6 +70,7 @@ def test_human_output_golden_and_na_strings(tmp_path):
     assert "questions:topics per batch (mean): 2.33" in out
     assert "questions:topics overall: 2.30" in out
     assert "topic-only batches: 0 (0.0%)" in out
+    assert "no-question batches: 3 (9.7%)" in out
     assert "questions/min: 1.21" in out
     assert "median batch cadence: 21.13 s" in out
     assert "time-to-first-question: 27.43 s" in out
@@ -112,6 +115,27 @@ def test_acted_on_and_repair_ratios_from_lifecycle_events(tmp_path):
     assert "repair rate: n/a (no suggest_reject events)" in m.format_metrics(no_repair)
 
 
+def test_no_question_vs_topic_only_batches_are_distinct():
+    events = [
+        {"ts": 0.0, "type": "session_start"},
+        {"ts": 10.0, "type": "suggest_result", "questions": [],
+         "topics": [{"name": "price", "priority": "high", "note": ""}]},
+        {"ts": 20.0, "type": "suggest_result", "questions": [], "topics": []},
+        {"ts": 30.0, "type": "session_end"},
+    ]
+    metrics = m.compute_metrics(events)
+
+    assert metrics["batches"] == 2
+    assert metrics["no_question_batches"] == 2
+    assert metrics["no_question_pct"] == pytest.approx(100.0)
+    assert metrics["topic_only_batches"] == 1
+    assert metrics["topic_only_pct"] == pytest.approx(50.0)
+
+    out = m.format_metrics(metrics)
+    assert "no-question batches: 2 (100.0%)" in out
+    assert "topic-only batches: 1 (50.0%)" in out
+
+
 def test_json_mode_is_valid_and_keys_are_stable():
     run = subprocess.run(
         [sys.executable, str(SCRIPT), str(FIXTURE), "--json"],
@@ -126,6 +150,8 @@ def test_json_mode_is_valid_and_keys_are_stable():
         "question_topic_ratio_batches",
         "question_topic_ratio_mean",
         "question_topic_ratio_overall",
+        "no_question_batches",
+        "no_question_pct",
         "topic_only_batches",
         "topic_only_pct",
         "questions_per_min",

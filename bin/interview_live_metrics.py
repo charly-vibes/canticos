@@ -3,8 +3,9 @@
 Responsibilities:
   - Load events.jsonl tolerantly (blank/malformed/non-object lines are skipped)
   - Compute pure metrics from event dicts: batch and payload counts,
-    questions:topics ratios, topic-only share, questions/min, median cadence,
-    acted-on and repair ratios, time-to-first-question, over-contract batches
+    questions:topics ratios, no-question and topic-only shares, questions/min,
+    median cadence, acted-on and repair ratios, time-to-first-question,
+    over-contract batches
   - Render a human report or stable-key JSON through a thin CLI
 Rationale: tuning the suggest pipeline's parameters needs a measurement loop,
   not a one-off heredoc. Metrics stay pure over event dicts so replay tests can
@@ -99,6 +100,8 @@ def compute_metrics(events, path=None):
             lifecycle[etype] += 1
 
     questions = sum(q for _, q, _ in batches)
+    # Real baseline (20261113-084517): 631 questions over 222 batches. The older
+    # 628 figure came from a different parser; never hard-code it here.
     topics = sum(t for _, _, t in batches)
     batch_count = len(batches)
 
@@ -108,6 +111,8 @@ def compute_metrics(events, path=None):
     )
     question_topic_ratio_overall = _ratio(questions, topics)
 
+    no_question = sum(1 for _, q, _ in batches if q == 0)
+    no_question_pct = (no_question / batch_count * 100.0) if batch_count else 0.0
     topic_only = sum(1 for _, q, t in batches if q == 0 and t > 0)
     topic_only_pct = (topic_only / batch_count * 100.0) if batch_count else 0.0
     over_contract = sum(1 for _, q, _ in batches if q == 0 or q > CONTRACT_MAX_QUESTIONS)
@@ -144,6 +149,8 @@ def compute_metrics(events, path=None):
         "question_topic_ratio_batches": len(ratio_batches),
         "question_topic_ratio_mean": question_topic_ratio_mean,
         "question_topic_ratio_overall": question_topic_ratio_overall,
+        "no_question_batches": no_question,
+        "no_question_pct": no_question_pct,
         "topic_only_batches": topic_only,
         "topic_only_pct": topic_only_pct,
         "questions_per_min": questions_per_min,
@@ -177,6 +184,8 @@ def format_metrics(metrics):
         f"questions:topics per batch (mean): {_num(metrics['question_topic_ratio_mean'])}"
         f" ({metrics['question_topic_ratio_batches']} batches with topics)",
         f"questions:topics overall: {_num(metrics['question_topic_ratio_overall'])}",
+        f"no-question batches: {metrics['no_question_batches']} "
+        f"({metrics['no_question_pct']:.1f}%)",
         f"topic-only batches: {metrics['topic_only_batches']} "
         f"({metrics['topic_only_pct']:.1f}%)",
     ])
