@@ -72,17 +72,24 @@ def _stem_es(word):
     return word
 
 
-def token_set(text):
-    """Content tokens used for paraphrase similarity. Deliberately separate from
-    normalize_topic: keys stay exact so stored identity and lookups don't shift."""
-    tokens = set()
+def content_tokens(text):
+    """Ordered content tokens (stopwords removed, es-stemmed). Shared by
+    token_set and by the grounds matcher, which needs token order to compare a
+    quote against contiguous line slices."""
+    tokens = []
     for word in normalize_topic(text).translate(_ACCENT_FOLD).split():
         if word in _ES_STOPWORDS:
             continue
         stem = _stem_es(word)
         if stem:
-            tokens.add(stem)
-    return frozenset(tokens)
+            tokens.append(stem)
+    return tokens
+
+
+def token_set(text):
+    """Content tokens used for paraphrase similarity. Deliberately separate from
+    normalize_topic: keys stay exact so stored identity and lookups don't shift."""
+    return frozenset(content_tokens(text))
 
 
 def _jaccard_sets(a, b):
@@ -90,6 +97,11 @@ def _jaccard_sets(a, b):
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def jaccard_sets(set_a, set_b):
+    """Jaccard overlap for callers that already tokenized (grounds matching)."""
+    return _jaccard_sets(set_a, set_b)
 
 
 def jaccard_score(text_a, text_b):
@@ -158,9 +170,12 @@ def parse_suggestion_output(text):
             for q in obj.get("questions") or []:
                 if isinstance(q, dict):
                     questions.append({"text": str(q.get("text", "")).strip(),
-                                      "priority": _prio(q.get("priority"))})
+                                      "priority": _prio(q.get("priority")),
+                                      "grounds": str(q.get("grounds") or "").strip(),
+                                      "contract_miss": False})
                 elif q:
-                    questions.append({"text": str(q).strip(), "priority": "medium"})
+                    questions.append({"text": str(q).strip(), "priority": "medium",
+                                      "grounds": "", "contract_miss": False})
             for t in obj.get("topics") or []:
                 if isinstance(t, dict):
                     topics.append({"name": str(t.get("name", "")).strip(),
@@ -171,12 +186,15 @@ def parse_suggestion_output(text):
             if questions or topics:
                 return questions, topics
     # legacy plain-line output: keep only explicit list items (Q1:, 2), - bullets)
+    # canticos-ap3: the fallback still works, but each item is marked as a
+    # contract miss so health metrics can count it without dropping the batch.
     questions = []
     list_re = re.compile(r"^\s*(?:[Qq]\d*|\d+|[-*\u2022])[:.)]?\s*(.*)$")
     for line in text.splitlines():
         m = list_re.match(line.strip())
         if m and m.group(1):
-            questions.append({"text": m.group(1).strip(), "priority": "medium"})
+            questions.append({"text": m.group(1).strip(), "priority": "medium",
+                              "grounds": "", "contract_miss": True})
     return questions, []
 
 
@@ -215,6 +233,8 @@ class Queue:
             if not key:
                 continue
             prio = q.get("priority") if isinstance(q, dict) else "medium"
+            extra = ({k: q.get(k) for k in ("grounds", "evidence", "contract_miss")
+                      if q.get(k) is not None} if isinstance(q, dict) else {})
             cur = self.questions.get(key)
             fuzzy = False
             if cur is None:
@@ -223,11 +243,16 @@ class Queue:
             if cur is None:
                 cur = {"key": key, "text": text, "priority": prio,
                        "mentions": 1, "added_at": now, "last_seen": now,
-                       "status": "pending", "shown": False, "score": 0}
+                       "status": "pending", "shown": False, "score": 0, **extra}
                 self.questions[key] = cur
             else:
                 cur["mentions"] += 1
                 cur["last_seen"] = now
+                for k, v in extra.items():
+                    if k == "contract_miss":
+                        cur[k] = bool(v)
+                    elif v not in (None, ""):
+                        cur[k] = v
                 if fuzzy:
                     # paraphrase: show the newest wording, keep the original key
                     cur["text"] = text

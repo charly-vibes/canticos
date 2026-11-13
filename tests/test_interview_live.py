@@ -2,7 +2,8 @@
 """Purpose: Verify interview-live's CLI contract without real audio, whisper or pi.
 Responsibilities: Exercise capture path selection (live vs --from), whisper -di
 diarization argv (offsets, language, model), transcript accumulation/dedup,
-pi suggestion session continuity, and failure handling through the real script
+pi suggestion prompting (stateless contract + rolling window + validation and
+repair), and failure handling through the real script
 with fake ffmpeg/whisper-cli/pi binaries.
 Rationale: canticos-59c — interviewing copilot must pin its transcript pipeline
 and suggestion loop so regressions surface before a real interview.
@@ -111,17 +112,32 @@ if model and model == os.environ.get('PI_FAIL_MODEL'):
 if os.environ.get('PI_FAIL'):
     print("pi: provider error", file=sys.stderr)
     sys.exit(1)
-if os.environ.get('PI_MODE') == 'json':
-    print(json.dumps({
-        "questions": [
-            {"text": "Q-A: Tell me more about the supplier problem and its cost.", "priority": "high"},
-            {"text": "Q-B: What did you do differently the following month?", "priority": "medium"},
-        ],
-        "topics": [
-            {"name": "Proveedor", "priority": "high", "note": "supplier problems"},
-            {"name": "Multa", "priority": "low", "note": "penalty cost"},
-        ],
-    }))
+VALID_JSON = {
+    "questions": [
+        {"text": "Q-A: Tell me more about the supplier problem and its cost.",
+         "priority": "high", "grounds": "tuvimos un problema con el proveedor"},
+        {"text": "Q-B: What did you do differently the following month?",
+         "priority": "medium", "grounds": "Pagamos una multa"},
+    ],
+    "topics": [
+        {"name": "Proveedor", "priority": "high", "note": "supplier problems"},
+        {"name": "Multa", "priority": "low", "note": "penalty cost"},
+    ],
+}
+EMPTY_JSON = {"questions": [], "topics": [{"name": "Senal", "priority": "medium", "note": "x"}]}
+if os.environ.get('PI_MODE') in ('empty_first', 'empty_always'):
+    counter = os.environ.get('PI_COUNT_FILE')
+    n = 0
+    if counter:
+        p = Path(counter)
+        n = int(p.read_text()) if p.exists() else 0
+        p.write_text(str(n + 1))
+    if os.environ['PI_MODE'] == 'empty_always' or n == 0:
+        print(json.dumps(EMPTY_JSON))
+    else:
+        print(json.dumps(VALID_JSON))
+elif os.environ.get('PI_MODE') == 'json':
+    print(json.dumps(VALID_JSON))
 else:
     print("Q1: Tell me more about the supplier problem and its cost.")
     print("Q2: What did you do differently the following month?")
@@ -149,6 +165,7 @@ def env(tmp_path):
                 FFMPEG_LOG=str(log / "ffmpeg.jsonl"),
                 WHISPER_LOG=str(log / "whisper.jsonl"),
                 PI_LOG=str(log / "pi.jsonl"),
+                PI_COUNT_FILE=str(log / "pi_count.txt"),
                 ORDER_LOG=str(log / "order.txt"),
                 INTERVIEW_MIC="test-mic", INTERVIEW_MONITOR="test-sink.monitor")
 
@@ -201,8 +218,9 @@ def test_session_directory_layout(env):
 
 
 def test_session_dir_auto_name(env):
-    """canticos-det: without --session the dir is interview-YYYYMMDD-HHMMSS
-    and the pi suggestion session carries the same name."""
+    """canticos-det: without --session the dir is interview-YYYYMMDD-HHMMSS.
+    canticos-ate: suggestion calls are stateless, so pi argv no longer carries
+    the session name; the artifact directory contract is what matters here."""
     r = run(env, "--rounds", "1", "--every", "0.2", "--min-segments", "1",
             "--pi-model", "fake-model", live=True)
     assert r.returncode == 0, r.stderr
@@ -211,7 +229,7 @@ def test_session_dir_auto_name(env):
     assert len(dirs) == 1, dirs
     assert re.fullmatch(r"interview-\d{8}-\d{6}", dirs[0]), dirs
     pi_calls = log_lines(env, "PI")
-    assert dirs[0] in " ".join(pi_calls[0])  # pi --session-id matches the dir name
+    assert pi_calls and all("--session-id" not in call for call in pi_calls)
 
 
 def test_session_name_rejects_path_traversal(env):
@@ -638,26 +656,6 @@ def test_transcription_continues_while_pi_thinks(env):
     assert "proveedor" in txt
 
 
-def test_live_mode_pi_session_continuity(env):
-    # 3 rounds / 2s: round 3 fires the first batch (turn-end + quiet floor),
-    # the end-of-run flush fires the second.
-    run(env, "--rounds", "3", "--every", "2", "--min-segments", "1", live=True)
-    calls = log_lines(env, "PI")
-    assert len(calls) == 2
-    first, second = calls[0], calls[1]
-    # first call: --session-id + --system-prompt (Mom Test methodology) + transcript
-    assert first[0] == "--session-id"
-    assert "--system-prompt" in first
-    joined = " ".join(first).lower()
-    assert "mom test" in joined
-    # second call: same session, no system prompt (methodology persists), new text
-    assert second[0] == "--session-id"
-    assert "--system-prompt" not in second
-    # suggestions saved (parsed from plain lines into bullet form)
-    q = [f for f in out_files(env, ".md") if "questions" in f.name]
-    assert q and "supplier problem" in q[0].read_text()
-
-
 def test_from_mode_single_pass(env):
     rec = Path(env['HOME']) / "rec.mka"
     rec.write_bytes(b"fake-audio")
@@ -672,7 +670,8 @@ def test_from_mode_single_pass(env):
     assert len(w) == 1 and "-di" in w[0]
     assert "speaker 0" in transcript_text(env)
     pi = log_lines(env, "PI")
-    assert len(pi) == 1 and pi[0][0] == "--session-id"
+    assert len(pi) == 1 and pi[0][0] == "--print"
+    assert "--session-id" not in pi[0]
     assert "--system-prompt" in pi[0]
 
 
@@ -900,8 +899,8 @@ def test_suggest_result_carries_input_and_raw_output(env):
     first = results[0]
     assert any("supplier problem" in q for q in first["questions"])
     assert any(t["name"] == "Proveedor" for t in first["topics"])
-    # input_lines is byte-identical to the transcript argument pi actually got
-    assert first["input_lines"] == log_lines(env, "PI")[0][-1]
+    # input_lines keeps its delta meaning; the stateless prompt embeds it
+    assert first["input_lines"] in log_lines(env, "PI")[0][-1]
 
 
 def test_whisper_timeout_returns_empty(monkeypatch):
@@ -950,6 +949,241 @@ def test_effective_participants_tui_overrides_args():
         participants = 4
 
     assert sug.effective_participants(2, Stub()) == 4
+
+
+# -- stateless prompt digest (canticos-ate) -----------------------------------
+
+def test_pi_prompt_budget_is_p03():
+    assert sug.PROMPT_BUDGET == 12000
+
+
+def test_build_pi_cmd_is_stateless_and_carries_contract_every_round():
+    """No --session-id: every suggestion call is self-contained and carries the
+    Mom Test system contract, whether it is the first round or a later one."""
+    pending = [{"text": "¿Cuánto pagaste?", "priority": "high", "last_seen": time.time()}]
+    first = sug.build_pi_cmd("sess", True, "m1", 2, None, "NEW-ONE",
+                             window_lines=["[00:00:01] (speaker 1) old context"],
+                             pending=[])
+    later = sug.build_pi_cmd("sess", False, "m1", 2, None, "NEW-TWO",
+                             window_lines=["[00:00:01] (speaker 1) old context"],
+                             pending=pending)
+    for cmd in (first, later):
+        assert "--session-id" not in cmd
+        assert cmd[:2] == ["pi", "--print"]
+        assert "--system-prompt" in cmd
+        assert "Mom Test" in cmd[cmd.index("--system-prompt") + 1]
+    # every round carries a full prompt: window, new lines, digest
+    assert "old context" in first[-1] and "NEW-ONE" in first[-1]
+    assert "PENDING QUESTIONS" in later[-1]
+    assert "¿Cuánto pagaste?" in later[-1]
+    # the first round has no pending digest to show
+    assert "PENDING QUESTIONS" not in first[-1]
+
+
+def test_prompt_budget_trims_window_first_then_digest():
+    now = 1000.0
+    window = [f"[00:{i:02d}] window line {i} " + "w" * 300 for i in range(40)]
+    pending = [{"text": f"pending q{i} " + "p" * 200, "priority": "medium",
+                "last_seen": now} for i in range(5)]
+    prompt = sug.build_prompt("NEW-ESSENTIAL", window_lines=window,
+                              pending=pending, now=now, max_chars=900)
+    assert len(prompt) <= 900
+    # new lines are never trimmed; the oldest window lines go first
+    assert "NEW-ESSENTIAL" in prompt
+    assert "window line 0" not in prompt
+    # top digest entry survives while the tail is already gone
+    assert "pending q0" in prompt
+    assert "pending q4" not in prompt
+
+
+def test_prompt_digest_skips_expired_and_caps_at_five():
+    now = 1000.0
+    stale = [{"text": f"stale {i}", "priority": "high", "last_seen": 0.0}
+             for i in range(2)]
+    fresh = [{"text": f"fresh {i}", "priority": "medium", "last_seen": now}
+             for i in range(7)]
+    lines = sug.digest_lines(stale + fresh, now=now)
+    assert len(lines) == 5
+    assert all("stale" not in line for line in lines)
+    assert lines[0].startswith('1. "fresh 0"')
+
+
+def test_pi_cmd_total_prompt_stays_within_budget():
+    window = [f"[00:{i:02d}] " + "x" * 500 for i in range(40)]
+    pending = [{"text": "q" * 400, "priority": "low", "last_seen": time.time()}
+               for _ in range(5)]
+    cmd = sug.build_pi_cmd("sess", False, "m", 2, None, "NEW",
+                           window_lines=window, pending=pending)
+    sys_prompt = cmd[cmd.index("--system-prompt") + 1]
+    assert len(sys_prompt) + len(cmd[-1]) <= sug.PROMPT_BUDGET
+
+
+def test_live_mode_suggestion_rounds_are_stateless(env):
+    """Keep the first-round/later-round invariant under the stateless contract:
+    round one has no earlier context or pending digest; later rounds carry the
+    rolling window and the digest — and BOTH carry the system prompt."""
+    # 3 rounds / 2s: round 3 fires the first batch (turn-end + quiet floor),
+    # the end-of-run flush fires the second.
+    run(env, "--rounds", "3", "--every", "2", "--min-segments", "1", live=True)
+    calls = log_lines(env, "PI")
+    assert len(calls) == 2
+    first, second = calls
+    for call in (first, second):
+        assert "--session-id" not in call
+        assert call[0] == "--print"
+        assert "--system-prompt" in call
+        assert "mom test" in call[call.index("--system-prompt") + 1].lower()
+    # first batch: no rolling context, no pending digest yet
+    assert "RECENT TRANSCRIPT WINDOW" not in first[-1]
+    assert "PENDING QUESTIONS" not in first[-1]
+    # later batch: window + digest of what was already suggested
+    assert "RECENT TRANSCRIPT WINDOW" in second[-1]
+    assert "PENDING QUESTIONS" in second[-1]
+    assert "supplier problem" in second[-1].lower()
+    # suggestions saved (parsed from plain lines into bullet form)
+    q = [f for f in out_files(env, ".md") if "questions" in f.name]
+    assert q and "supplier problem" in q[0].read_text()
+
+# -- contract hardening (canticos-ap3) ----------------------------------------
+
+WINDOW_ES = [
+    "[00:00:05] (speaker 1) Bueno, el mes pasado tuvimos un problema con el proveedor",
+    "[00:00:14] (speaker 1) Pagamos una multa y perdimos dos semanas",
+]
+
+
+def test_parse_suggestion_output_parses_grounds_quote():
+    """The contract now carries grounds as its own field, not buried in text."""
+    out = json.dumps({
+        "questions": [{"text": "¿Cuánto pagaste?", "priority": "high",
+                       "grounds": "Pagamos una multa"}],
+        "topics": [],
+    })
+    qs, _ = core.parse_suggestion_output(out)
+    assert qs[0]["grounds"] == "Pagamos una multa"
+    assert not qs[0].get("contract_miss")
+
+
+def test_parse_plain_lines_marks_contract_miss():
+    """Legacy plain-line output must keep working but be countable as a miss."""
+    qs, _ = core.parse_suggestion_output("Q1: Tell me about the supplier.\nQ2: Next?")
+    assert len(qs) == 2
+    assert all(q["contract_miss"] for q in qs)
+    assert all(q["grounds"] == "" for q in qs)
+
+
+def test_validate_round_requires_at_least_one_question():
+    accepted, rejected, reasons = sug.validate_round([], [{"name": "x"}], WINDOW_ES)
+    assert accepted == [] and rejected == []
+    assert "no-questions" in reasons
+
+
+def test_validate_round_verifies_spanish_grounds_fuzzily():
+    """Light es morphology keeps accent/case/plural variants of the quote
+    matching the transcript line (shared with the dedupe normalizer)."""
+    qs = [{"text": "¿Cuánto pagaste?", "priority": "high",
+           "grounds": "PAGAMOS una multa"}]
+    accepted, rejected, reasons = sug.validate_round(qs, [], WINDOW_ES)
+    assert len(accepted) == 1 and rejected == []
+    assert accepted[0]["evidence"] == "grounds"
+    assert "no-evidence" not in reasons
+
+
+def test_validate_round_demotes_hallucinated_grounds_not_deletes():
+    qs = [{"text": "¿Por qué gritó el gerente?", "priority": "high",
+           "grounds": "el gerente nos grito de repente"}]
+    accepted, rejected, reasons = sug.validate_round(qs, [], WINDOW_ES)
+    assert len(accepted) == 1, "demoted question must never be deleted"
+    assert accepted[0]["evidence"] == "no-evidence"
+    assert rejected == []
+    assert "no-evidence" in reasons
+
+
+def test_validate_round_flags_too_many_topics_but_keeps_questions():
+    topics = [{"name": f"t{i}"} for i in range(3)]
+    accepted, _, reasons = sug.validate_round(
+        [{"text": "q", "grounds": "Pagamos una multa"}], topics, WINDOW_ES)
+    assert accepted and "too-many-topics" in reasons
+    _, _, two = sug.validate_round([{"text": "q"}], topics[:2], WINDOW_ES)
+    assert "too-many-topics" not in two
+
+
+def test_validate_round_plain_fallback_is_contract_miss_but_kept():
+    qs, _ = core.parse_suggestion_output("Q1: Tell me about the supplier.")
+    accepted, rejected, reasons = sug.validate_round(qs, [], WINDOW_ES)
+    assert len(accepted) == 1 and rejected == []
+    assert accepted[0]["text"] == "Tell me about the supplier."
+    assert "contract-miss" in reasons
+
+
+def test_empty_batch_repairs_once_then_ingests(env):
+    """A zero-question batch triggers exactly one repair round on the same
+    model; the repaired batch is ingested and logged as suggest_repair."""
+    env_ = {**env, "PI_MODE": "empty_first"}
+    rec = Path(env_["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run(env_, "--from", str(rec), "--session", "repair-once")
+    assert r.returncode == 0, r.stderr
+    calls = log_lines(env_, "PI")
+    assert len(calls) == 2, "expected exactly one repair call"
+    assert "--system-prompt" in calls[1]
+    # the rejected output is quoted back into the repair prompt
+    assert '"questions": []' in calls[1][-1]
+    models = [c[c.index("--model") + 1] for c in calls]
+    assert models[0] == models[1]
+    events = session_events(env_, "repair-once")
+    repairs = [e for e in events if e["type"] == "suggest_repair"]
+    assert len(repairs) == 1
+    assert repairs[0]["reason"] == "no-questions"
+    assert '"questions": []' in repairs[0]["rejected"]
+    assert not [e for e in events if e["type"] == "suggest_reject"]
+    results = [e for e in events if e["type"] == "suggest_result"]
+    assert results and results[0]["questions"], results
+    q = [f for f in out_files(env_, ".json") if "queue" in f.name]
+    assert q and json.loads(q[0].read_text())["questions"]
+
+
+def test_empty_batch_after_repair_emits_suggest_reject(env):
+    """No retry loops: a still-empty repair emits suggest_reject once."""
+    env_ = {**env, "PI_MODE": "empty_always"}
+    rec = Path(env_["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    r = run(env_, "--from", str(rec), "--session", "repair-reject")
+    assert r.returncode == 0, r.stderr
+    calls = log_lines(env_, "PI")
+    assert len(calls) == 2, "repair must not loop"
+    events = session_events(env_, "repair-reject")
+    reps = [e for e in events if e["type"] == "suggest_repair"]
+    rejects = [e for e in events if e["type"] == "suggest_reject"]
+    assert len(reps) == 1 and len(rejects) == 1
+    assert "no-questions" in rejects[0]["reasons"]
+    assert not [e for e in events if e["type"] == "suggest_result"]
+
+
+def test_repair_is_skipped_when_a_newer_batch_is_pending(env, monkeypatch):
+    """The repair inherits the stale guard: a newer enqueued batch means the
+    rejected output is no longer worth a second pi call."""
+    rec = Path(env["HOME"]) / "rec.mka"
+    rec.write_bytes(b"fake-audio")
+    mod = load_cli_module()
+    args = mod.parse_args(["--from", str(rec), "--session", "stale-repair",
+                           "--out", env["INTERVIEW_DIR"]])
+    tool = mod.InterviewLive(args)
+    empty = json.dumps({"questions": [], "topics": []})
+    calls = []
+
+    def fake_pi(cmd, timeout):
+        calls.append(cmd)
+        return empty, None
+
+    monkeypatch.setattr(tool, "_run_pi", fake_pi)
+    tool._suggest_seq = 2
+    tool.suggest(["[00:00:05] (speaker 1) hola"], True, seq=1)
+    tool.log.close()
+    assert len(calls) == 1, "stale repair must be skipped"
+    events = session_events(env, "stale-repair")
+    assert not [e for e in events if e["type"] in ("suggest_repair", "suggest_reject")]
+
 
 # -- trigger policy (canticos-2iv) -------------------------------------------
 # Measured baseline: 222 batches / 83.5min (median 21s), 628 questions, 587
@@ -1078,8 +1312,9 @@ def session_events(env_, session):
 
 
 def test_question_model_unset_pins_default_pi_argv(env):
-    """Anti-goal: with --question-model unset the pi argv is byte-identical to
-    the pre-flag default (one call, one --model, no extra flags)."""
+    """Anti-goal: with --question-model unset the pi argv stays minimal (one
+    call, one --model, no extra flags) — but canticos-ate made it stateless:
+    no --session-id, and the system contract rides every round."""
     rec = Path(env['HOME']) / "rec.mka"
     rec.write_bytes(b"fake-audio")
     r = run(env, "--from", str(rec), "--session", "argv-pin")
@@ -1087,12 +1322,11 @@ def test_question_model_unset_pins_default_pi_argv(env):
     calls = log_lines(env, "PI")
     assert len(calls) == 1
     result = next(e for e in session_events(env, "argv-pin") if e["type"] == "suggest_result")
-    assert calls[0] == [
-        "--session-id", "argv-pin", "--print",
-        "--system-prompt", sug.system_prompt(2),
-        "--model", DEFAULT_PI_MODEL,
-        result["input_lines"],
-    ]
+    assert "--session-id" not in calls[0]
+    assert calls[0][0] == "--print"
+    assert calls[0][1:3] == ["--system-prompt", sug.system_prompt(2)]
+    assert calls[0][3:5] == ["--model", DEFAULT_PI_MODEL]
+    assert result["input_lines"] in calls[0][-1]
     assert not [e for e in session_events(env, "argv-pin") if e["type"] == "suggest_fallback"]
 
 

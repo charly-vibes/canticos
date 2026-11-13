@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -73,6 +74,10 @@ class InterviewLive:
         self.interrupted = False
         self.participants = args.participants
         self.queue = core.Queue()
+        # canticos-ap3/ate: rendered transcript lines for grounds validation and
+        # the stateless rolling window; bounded so a long interview stays cheap.
+        self.recent_lines = deque(maxlen=sug.RECENT_WINDOW_LINES)
+        self._recent_lock = threading.Lock()  # worker appends, suggester snapshots
         self.ui = None  # tui.TuiState when the dashboard is active
         self.log = evlog.EventLog(self.events_path)
         self.started_at = time.time()
@@ -142,23 +147,22 @@ class InterviewLive:
         are skipped, but their lines ride along with the newest batch — a stale
         drop must never remove transcript segments from the model's view."""
         def loop():
-            carry, carry_first = [], False
+            carry = []
             while True:
                 item = self._suggest_q.get()
                 if item is None:
                     break
-                seq, lines, first = item
+                seq, lines = item
                 carry.extend(lines)
-                carry_first = carry_first or first
                 with self._suggest_lock:
                     newest = self._suggest_seq
                 if seq < newest:
                     self.log.emit("suggest_stale_drop", skipped=seq, newest=newest)
                     continue
-                lines, first = carry, carry_first
-                carry, carry_first = [], False
+                lines = carry
+                carry = []
                 try:
-                    self.suggest(lines, first)
+                    self.suggest(lines, False, seq)
                 except Exception as e:  # noqa: BLE001 — one bad batch must not kill suggestions
                     try:
                         self.log.emit("suggest_error", reason=f"thread:{type(e).__name__}:{e}")
@@ -166,7 +170,7 @@ class InterviewLive:
                         pass
             if carry:  # defensive: never discard carried lines at shutdown
                 try:
-                    self.suggest(carry, carry_first)
+                    self.suggest(carry, False)
                 except Exception:  # noqa: BLE001
                     pass
         self._suggest_thread = threading.Thread(target=loop, daemon=True)
@@ -180,10 +184,20 @@ class InterviewLive:
             self._suggest_thread.join(timeout)
             self._suggest_thread = None
 
-    def _enqueue_suggestions(self, lines, first):
+    def _enqueue_suggestions(self, lines):
         with self._suggest_lock:
             self._suggest_seq += 1
-            self._suggest_q.put((self._suggest_seq, list(lines), first))
+            self._suggest_q.put((self._suggest_seq, list(lines)))
+
+    def _recent_snapshot(self):
+        """Copy the rolling window under a lock: the suggester thread reads it
+        while the worker appends, and deque iteration is not mutation-safe."""
+        with self._recent_lock:
+            return list(self.recent_lines)
+
+    def _remember_lines(self, lines):
+        with self._recent_lock:
+            self.recent_lines.extend(lines)
 
     def _run_pi(self, cmd, timeout):
         """Run one pi suggestion call; returns (raw_stdout, failure_reason).
@@ -213,25 +227,47 @@ class InterviewLive:
             self.ui.suggestion = "error"
         self.log.emit("suggest_error", reason=reason)
 
-    def suggest(self, new_lines, first):
+    def suggest(self, new_lines, first, seq=None):
+        """Run one stateless suggestion round (canticos-ate). `first` is kept
+        for call-site compatibility and no longer changes the prompt; `seq` lets
+        the repair path honor the stale-batch guard."""
         input_lines = "\n".join(new_lines)
+        # Validation sees the same rolling window the model does, plus this
+        # batch's lines; the context passed to pi excludes the new lines so the
+        # prompt does not duplicate them.
+        context = self._recent_snapshot()
+        if new_lines:
+            # A batch can be longer than the window (a long pi stall coalesces
+            # batches); drop only the overlapping suffix so context and new
+            # lines never duplicate each other in the prompt.
+            tail = list(new_lines)
+            for k in range(min(len(context), len(tail)), 0, -1):
+                if context[-k:] == tail[-k:]:
+                    context = context[:-k]
+                    break
+        validation_window = context + list(new_lines)
+        pending = self.queue.pending_questions()
         question_model = self.args.question_model
         if self.ui:
             self.ui.suggestion = "thinking"
         cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
                                self.participants, self.ui, input_lines,
-                               question_model=question_model)
+                               question_model=question_model,
+                               window_lines=context, pending=pending)
         # canticos-7h9: the strong model gets a soft 45s budget (P-04); any
         # timeout/failure/nonzero/empty falls back once to --pi-model.
         raw, failure = self._run_pi(
             cmd, sug.QUESTION_MODEL_TIMEOUT_S if question_model else sug.PI_TIMEOUT_S)
         degraded = False
+        model_used = question_model or self.args.pi_model
         if failure and question_model:
             self.log.emit("suggest_fallback", reason=failure,
                           strong_model=question_model,
                           fallback_model=self.args.pi_model)
+            model_used = self.args.pi_model
             cmd = sug.build_pi_cmd(self.session_name, first, self.args.pi_model,
-                                   self.participants, self.ui, input_lines)
+                                   self.participants, self.ui, input_lines,
+                                   window_lines=context, pending=pending)
             raw, failure = self._run_pi(cmd, sug.PI_TIMEOUT_S)
             degraded = failure is None
         if failure:
@@ -239,6 +275,40 @@ class InterviewLive:
             return
         out = raw.strip()
         questions, topics = core.parse_suggestion_output(out)
+        questions, _rejected, reasons = sug.validate_round(
+            questions, topics, validation_window)
+        repaired = False
+        if sug.REASON_NO_QUESTIONS in reasons:
+            # canticos-ap3: exactly ONE repair round. The stale guard wins: if a
+            # newer batch is already queued, a second call would waste the model
+            # on context the next batch is about to replace.
+            if seq is not None:
+                with self._suggest_lock:
+                    newest = self._suggest_seq
+                if seq < newest:
+                    self.log.emit("suggest_stale_drop", skipped=seq, newest=newest)
+                    return
+            self.log.emit("suggest_repair", reason=sug.REASON_NO_QUESTIONS,
+                          rejected=out)
+            repair_cmd = sug.build_pi_cmd(
+                self.session_name, True, self.args.pi_model,
+                self.participants, self.ui, input_lines,
+                question_model=model_used, repair=out,
+                window_lines=context, pending=pending)
+            repair_timeout = (sug.PI_TIMEOUT_S if model_used == self.args.pi_model
+                              else sug.QUESTION_MODEL_TIMEOUT_S)
+            raw, failure = self._run_pi(repair_cmd, repair_timeout)
+            if failure:
+                self._reject(reasons, failure)
+                return
+            out = raw.strip()
+            questions, topics = core.parse_suggestion_output(out)
+            questions, _rejected, reasons = sug.validate_round(
+                questions, topics, validation_window)
+            if sug.REASON_NO_QUESTIONS in reasons:
+                self._reject(reasons, None)
+                return
+            repaired = True
         self.queue.ingest(questions, topics)
         self._write_queue_json()
         with open(self.questions_path, "a") as fh:
@@ -255,12 +325,24 @@ class InterviewLive:
                       input_lines=input_lines,
                       raw_output=raw,
                       questions=[q["text"] for q in questions],
-                      topics=topics)
+                      topics=topics,
+                      repaired=repaired,
+                      reasons=reasons)
         if self.ui:
             self.ui.suggestion = "done (fallback)" if degraded else "done"
         else:
             sys.stdout.write(f"\n--- follow-up questions ({time.strftime('%H:%M:%S')}) ---\n{out}\n\n")
             self._emit_shown()
+
+    def _reject(self, reasons, failure):
+        """The single repair round still broke the contract (or pi failed on
+        it): log the rejection and stop — no retry loops (canticos-ap3)."""
+        payload = {"reasons": reasons}
+        if failure:
+            payload["error"] = failure
+        self.log.emit("suggest_reject", **payload)
+        if self.ui:
+            self.ui.suggestion = "error"
 
     def _emit_shown(self):
         """Plain mode's rendered view is the stdout round, so every unshown
@@ -342,7 +424,6 @@ class InterviewLive:
         transcription round (canticos-2iv)."""
         ui = self.ui
         offset_ms = 0
-        first = True
         policy = trig.TriggerPolicy(min_segments=self.args.min_segments)
         window_s = self.args.window or self.args.every
 
@@ -352,7 +433,6 @@ class InterviewLive:
         def fire(force=False):
             """Enqueue the pending batch when the policy (or a manual force)
             says so; returns True when a batch was enqueued."""
-            nonlocal first
             reason = "force" if force else policy.due(time.monotonic())
             if not reason:
                 return False
@@ -362,8 +442,7 @@ class InterviewLive:
             self.log.emit("suggest_trigger", reason=reason, segments=len(drained))
             self._enqueue_suggestions(
                 [core.render_segment_line(s[0], s[2], s[3], self.speaker_names)
-                 for s in drained], first)
-            first = False
+                 for s in drained])
             return True
 
         for _ in range(rounds):
@@ -415,6 +494,7 @@ class InterviewLive:
                                   speaker=spk, text=text)
                 with open(self.transcript_path, "a") as fh:
                     fh.write("\n".join(lines) + "\n")
+                self._remember_lines(lines)
                 if ui:
                     ui.last_offset_ms = offset_ms
                 else:
