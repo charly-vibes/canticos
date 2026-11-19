@@ -44,7 +44,9 @@ def cached-scan [rec] {
   let key = (cache-key $rec.path)
   let cfile = ((cache-dir) | path join $"($key).json")
   if ($cfile | path exists) {
-    try { return (open --raw $cfile | from json) } catch { null }
+    let cached = (try { open --raw $cfile | from json } catch { null })
+    if $cached != null { return $cached }
+    rm -f $cfile  # corrupt entry: rebuild instead of crashing downstream
   }
   let sc = (scan-file $rec)
   let rows = (error-rows $sc.meta $sc.pairs)
@@ -233,8 +235,7 @@ def error-rows [s pairs] {
 }
 
 def "main list" [--project: string, --since: string, --until: string, --source: string] {
-  session-files
-  | each {|rec| meta-from-entries (parse-jsonl $rec.path) $rec }
+  cached-all | get meta
   | where {|s| $source == null or $s.source == $source}
   | where {|s| $project == null or $s.project == $project}
   | where {|s| in-window $s $since $until}
@@ -285,7 +286,7 @@ def "main stats" [session_id?: string, --all, --source: string] {
     let rows = ($scans | get errors | flatten)
     {
       sessions: ($scans | length),
-      tool_calls: ($scans | get meta | get tool_calls | math sum),
+      tool_calls: (if ($scans | is-empty) { 0 } else { $scans | get meta | get tool_calls | math sum }),
       errors: ($rows | length),
       by_class: (group-counts $rows "class"),
       by_source: (group-counts ($scans | get meta) "source"),

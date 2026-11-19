@@ -2,6 +2,9 @@
 
 ## 2026-11-19
 
+### Fixed
+- `terapia`: review follow-ups (canticos-25j, canticos-0l8, canticos-cjt, canticos-mla) — `stats --all` no longer crashes when zero scans survive (empty corpora or `--source` naming a missing dir); corrupt cache entries are deleted and rebuilt instead of crashing downstream; `list` now goes through the mtime meta cache (4163-file corpus: `list --source omp` 45 s → 1.4 s warm); test `run()` points `TERAPIA_CACHE` inside the temp dir so fixture scans stop polluting the real `~/.cache/terapia`. Tests: 20/20 (4 new).
+
 ### Added
 - `terapia`: **multi-source scan** — alongside pi (`~/.pi/agent/sessions`) it now scans the omp corpus (`~/.omp/agent/sessions`; same JSONL dialect, plus nested subagent transcripts `<project>/<session>/<agent>.jsonl`, decoded with omp's single-dash project encoding). Every output row gains `source`; omp rows also gain `agent` and `title`; `--source pi|omp` filters `list`, `errors --all` and `stats --all`; `stats --all` gains `by_source`. Cache key bumped to v2 so pre-source cached rows can't leak back in. Fixture corpus measured: omp 1069 sessions / 88670 tool calls / 1745 errors; cached `stats --all` 1.3 s vs 58 s cold. Tests: 16/16 (4 new: omp list metadata, `--source` filter, mixed-source stats/errors, omp id resolution).
 

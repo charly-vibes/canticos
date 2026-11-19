@@ -1,6 +1,7 @@
 """Tests for terapia — the pi + omp session query CLI."""
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ def run(*args, env_sessions=None):
         omp = env_sessions / "omp"
         omp.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ, TERAPIA_SESSIONS=str(env_sessions),
-                   TERAPIA_OMP_SESSIONS=str(omp))
+                   TERAPIA_OMP_SESSIONS=str(omp), TERAPIA_CACHE=str(env_sessions / "cache"))
     return subprocess.run(
         ["nu", "--no-config-file", str(TERAPIA), *args],
         capture_output=True, text=True, env=env,
@@ -199,7 +200,6 @@ def test_session_prefix_resolution(tmp):
 def test_cache_created_and_reused(tmp):
     write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
     cache = tmp / "cache"
-    import os
     env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_OMP_SESSIONS=str(tmp / "omp"), TERAPIA_CACHE=str(cache))
     r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
                        capture_output=True, text=True, env=env)
@@ -217,7 +217,6 @@ def test_cache_created_and_reused(tmp):
 def test_cache_invalidated_on_change(tmp):
     sid = write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
     cache = tmp / "cache"
-    import os
     env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_OMP_SESSIONS=str(tmp / "omp"), TERAPIA_CACHE=str(cache))
     r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
                        capture_output=True, text=True, env=env)
@@ -304,6 +303,48 @@ def test_tools_on_omp_session(tmp):
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
     assert [(t["tool"], t["isError"]) for t in out] == [("edit", True)]
+
+
+def test_stats_all_empty_corpora(tmp):
+    # fresh machine / missing corpus dirs must not crash (canticos-25j)
+    r = run("stats", "--all", env_sessions=tmp)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out == {"sessions": 0, "tool_calls": 0, "errors": 0, "by_class": {}, "by_source": {}}
+
+
+def test_corrupt_cache_is_rescanned(tmp):
+    # truncated cache writes must rebuild, not crash downstream (canticos-0l8)
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
+    cache = tmp / "cache"
+    cache.mkdir()
+    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_OMP_SESSIONS=str(tmp / "omp"), TERAPIA_CACHE=str(cache))
+    args = ["nu", "--no-config-file", str(TERAPIA), "stats", "--all"]
+    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    assert json.loads(r.stdout)["errors"] == 2
+    for f in cache.glob("*.json"):
+        f.write_text("{corrupt")
+    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["errors"] == 2, "corrupt cache entry must be rebuilt"
+
+
+def test_list_uses_cache(tmp):
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
+    cache = tmp / "cache"
+    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_OMP_SESSIONS=str(tmp / "omp"), TERAPIA_CACHE=str(cache))
+    r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "list"], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)[0]["id"] == "sid-aaa"
+    assert list(cache.glob("*.json")), "list should go through the meta cache (canticos-cjt)"
+
+
+def test_run_isolates_cache(tmp):
+    # fixture scans must not land in the real ~/.cache/terapia (canticos-mla)
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
+    r = run("stats", "--all", env_sessions=tmp)
+    assert r.returncode == 0, r.stderr
+    assert list((tmp / "cache").glob("*.json")), "run() should point TERAPIA_CACHE inside the fixture dir"
 
 
 if __name__ == "__main__":
