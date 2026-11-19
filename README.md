@@ -19,7 +19,7 @@ Cánticos, invocaciones, escrituras — scripts de uso personal.
 | `transcribe` | Transcribe audio a texto con whisper-cli |
 | `meeting-rec` | Graba audio de reuniones (micrófono + salida del sistema en pistas Opus separadas) en un `.mka` hasta Ctrl+C; detección automática de dispositivos via PipeWire |
 | `interview-live` | Copiloto de entrevistas Mom Test con dashboard reactivo (curses): al iniciar marca cuántos participantes hay, muestra el transcript en vivo y una cola priorizada de preguntas + temas importantes (los recurrentes suben solos). Transcribe micrófono + sistema en vivo (diarizado, L/0=entrevistador, R/1=invitado) y sugiere preguntas vía pi contra el plan individual qwen. Las sesiones viven en `<out>/<session>/` (`--list`/`--adopt`), hay replay (`--from`/`--replay`) y las sugerencias se disparan al terminar el turno del invitado, no por ronda — ver [interview-live](#interview-live) |
-| `terapia` | Consulta CLI en nushell sobre `~/.pi/agent/sessions`: sesiones, tool calls y errores clasificados como JSON — la alternativa estable al heredoc-parser de turno |
+| `terapia` | Consulta CLI en nushell sobre `~/.pi/agent/sessions` y `~/.omp/agent/sessions`: sesiones, tool calls y errores clasificados como JSON — la alternativa estable al heredoc-parser de turno |
 | `fi` | Wrapper de modelos libres (`:free`) para `pi`; alias simples (`laguna`, `nemo2`, `openrouter`) y paso directo; `doctor` / `list` / `--timeout` |
 
 ## Instalación
@@ -79,10 +79,11 @@ Cifras de referencia medidas sobre la sesión `~/Interviews/interview-20261113-0
 
 ### terapia
 
-Salida JSON tipada sobre el corpus de sesiones de Pi; implementa una de las recomendaciones del reporte `../pain/report.org` (contratos de salida estructurados, kill-the-heredoc).
+Salida JSON tipada sobre los corpus de sesiones de Pi y omp (`~/.pi/agent/sessions` y `~/.omp/agent/sessions`, mismo dialecto JSONL; omp incluye los subagentes `<proyecto>/<sesión>/<agente>.jsonl`); implementa una de las recomendaciones del reporte `../pain/report.org` (contratos de salida estructurados, kill-the-heredoc). Cada fila lleva `source` (`pi`/`omp`) y las de omp `agent` y `title`; `stats --all` añade `by_source`.
 
 ```sh
 terapia list --project areas/dev/gh/charly --since 2026-10-01  # sesiones como JSON
+terapia list --source omp --since 2026-11-01                   # solo omp (subagentes incluidos)
 terapia stats --all --since 2026-10-09                        # conteos + errores por clase
 terapia errors --all --group-by class                         # taxonomía de errores
 terapia tools <session-id> --tool bash --errors-only          # tool calls fallidos

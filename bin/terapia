@@ -1,20 +1,30 @@
 #!/usr/bin/env nu
 # terapia — therapy sessions for your agent's past lives.
 #
-# Stable, typed query CLI over ~/.pi/agent/sessions. One command per answer,
-# so you never write another bespoke heredoc parser over session JSONLs.
+# Stable, typed query CLI over agent-session JSONL corpora. One command per
+# answer, so you never write another bespoke heredoc parser over session files.
+#
+# Sources (scanned together; --source filters):
+#   pi    ~/.pi/agent/sessions   ($env.TERAPIA_SESSIONS)
+#   omp   ~/.omp/agent/sessions  ($env.TERAPIA_OMP_SESSIONS)
 #
 # Commands:
-#   list    [--project P] [--since D] [--until D]   sessions as JSON
-#   tools   <session-id> [--tool T] [--errors-only] tool calls + results
-#   errors  <session-id> | --all [--group-by K]     classified tool errors
-#   stats   <session-id> | --all                    counts + error breakdown
-#   raw     <session-id> [--type T]                 raw JSONL entries
+#   list    [--project P] [--since D] [--until D] [--source S]  sessions as JSON
+#   tools   <session-id> [--tool T] [--errors-only]             tool calls + results
+#   errors  <session-id> | --all [--group-by K] [--source S]    classified tool errors
+#   stats   <session-id> | --all [--source S]                   counts + error breakdown
+#   raw     <session-id> [--type T]                             raw JSONL entries
 #
 # Output is JSON on stdout. Errors go to stderr; exit 1 on failure.
 
-def sessions-dir [] {
-  $env.TERAPIA_SESSIONS? | default ($nu.home-dir | path join ".pi" "agent" "sessions")
+# Corpora to scan. Every output row carries `source`; omp nests subagent
+# transcripts (<project>/<session>/<agent>.jsonl) under the same decoding.
+def sources [] {
+  [
+    {source: "pi", dir: ($env.TERAPIA_SESSIONS? | default ($nu.home-dir | path join ".pi" "agent" "sessions"))},
+    {source: "omp", dir: ($env.TERAPIA_OMP_SESSIONS? | default ($nu.home-dir | path join ".omp" "agent" "sessions"))},
+  ]
+  | where {|s| ($s.dir | path exists)}
 }
 
 def cache-dir [] {
@@ -24,18 +34,19 @@ def cache-dir [] {
 # Cache key: path + mtime + size — any edit to the file changes it.
 def cache-key [path: string] {
   let st = (ls $path | first)
-  let sig = $"($path)|($st.modified? | format date '%s.%f')|($st.size? | default 0)"
+  # v2: cache rows gained `source` — old entries must not leak back in.
+  let sig = $"v2|($path)|($st.modified? | format date '%s.%f')|($st.size? | default 0)"
   $sig | hash md5
 }
 
 # Single-file scan with an mtime-keyed cache: {meta, errors} (errors = classified rows).
-def cached-scan [path: string] {
-  let key = (cache-key $path)
+def cached-scan [rec] {
+  let key = (cache-key $rec.path)
   let cfile = ((cache-dir) | path join $"($key).json")
   if ($cfile | path exists) {
     try { return (open --raw $cfile | from json) } catch { null }
   }
-  let sc = (scan-file $path)
+  let sc = (scan-file $rec)
   let rows = (error-rows $sc.meta $sc.pairs)
   mkdir (cache-dir)
   ({meta: $sc.meta, errors: $rows} | to json | save -f $cfile)
@@ -43,11 +54,13 @@ def cached-scan [path: string] {
 }
 
 def cached-all [] {
-  session-files | each {|f| cached-scan $f }
+  session-files | each {|rec| cached-scan $rec }
 }
 
-def dir-to-project [name: string] {
-  $name | str trim --char "-" | str replace --all "--" "/"
+# pi encodes "/" as "--"; omp as "-" (home-relative). Trim the leading marker first.
+def project-from-dir [source: string, name: string] {
+  let sep = (if $source == "omp" { "-" } else { "--" })
+  $name | str trim --char "-" | str replace --all $sep "/"
 }
 
 def parse-jsonl [path: string] {
@@ -57,18 +70,42 @@ def parse-jsonl [path: string] {
   | compact
 }
 
+# One record per transcript: {source, path, project, agent}.
+# pi: <project>/<session>.jsonl — omp adds <project>/<session>/<agent>.jsonl subagents.
 def session-files [] {
-  let root = (sessions-dir)
-  if not ($root | path exists) { return [] }
-  glob ($root | path join "*")
-  | where {|p| ($p | path type) == "dir"}
-  | sort
-  | each {|d| glob ($d | path join "*.jsonl") | sort }
+  sources
+  | each {|s|
+      let src = $s.source
+      let mains = (glob ($s.dir | path join "*" "*.jsonl")
+        | sort
+        | each {|p| {
+            source: $src,
+            path: $p,
+            project: (project-from-dir $src ($p | path dirname | path basename)),
+            agent: null,
+          }})
+      if $src == "omp" {
+        let subs = (glob ($s.dir | path join "*" "*" "*.jsonl")
+          | sort
+          | each {|p| {
+              source: $src,
+              path: $p,
+              project: (project-from-dir $src ($p | path dirname | path dirname | path basename)),
+              agent: ($p | path parse | get stem),
+            }})
+        $mains | append $subs
+      } else {
+        $mains
+      }
+    }
   | flatten
+  | sort-by path
 }
 
-def meta-from-entries [entries project path] {
+def meta-from-entries [entries rec] {
   let header = ($entries | where {|e| $e.type? == "session"} | first)
+  let titles = ($entries | where {|e| $e.type? == "title" and ($e.title? | default "" | str length) > 0})
+  let title = (if ($titles | is-empty) { $header.title? } else { $titles | last | get title })
   let msgs = ($entries | where {|e| $e.type? == "message"} | get message)
   let tool_calls = ($msgs
     | where {|m| $m.role? == "assistant"}
@@ -76,30 +113,41 @@ def meta-from-entries [entries project path] {
     | reduce -f 0 {|it, acc| $acc + $it })
   {
     id: ($header.id?),
-    project: $project,
-    file: $path,
+    source: $rec.source,
+    project: $rec.project,
+    agent: $rec.agent,
+    file: $rec.path,
     timestamp: ($header.timestamp?),
     cwd: ($header.cwd?),
+    title: $title,
     messages: ($msgs | where {|m| $m.role? != "toolResult"} | length),
     tool_calls: $tool_calls,
     errors: ($msgs | where {|m| $m.role? == "toolResult" and $m.isError? == true} | length),
   }
 }
 
-# Cheap: only the first JSONL line (the session header) per file.
-def header-of [path: string] {
-  let h = (^head -n1 $path | from json)
+# Cheap: read a small prefix. pi has the session header on line 1; omp puts a
+# `title` line first (its `session` entry carries id/timestamp/cwd as usual).
+def header-of [rec] {
+  let hs = (^head -n 20 $rec.path
+    | lines
+    | each {|l| try { $l | from json } catch { null } }
+    | compact
+    | where {|e| $e.type? == "session"})
+  let h = (if ($hs | is-empty) { {id: null} } else { $hs | first })
   {
     id: ($h.id?),
-    project: (dir-to-project ($path | path dirname | path basename)),
-    file: $path,
+    source: $rec.source,
+    project: $rec.project,
+    agent: $rec.agent,
+    file: $rec.path,
     timestamp: ($h.timestamp?),
     cwd: ($h.cwd?),
   }
 }
 
 def sessions-headers [] {
-  session-files | each {|f| header-of $f }
+  session-files | each {|rec| header-of $rec }
 }
 
 def resolve-session [session_id: string] {
@@ -161,11 +209,10 @@ def group-counts [rows key] {
 }
 
 # One pass per file: {meta, pairs} — used by --all commands.
-def scan-file [path: string] {
-  let project = (dir-to-project ($path | path dirname | path basename))
-  let entries = (parse-jsonl $path)
+def scan-file [rec] {
+  let entries = (parse-jsonl $rec.path)
   {
-    meta: (meta-from-entries $entries $project $path),
+    meta: (meta-from-entries $entries $rec),
     pairs: (pair-from-entries $entries),
   }
 }
@@ -175,6 +222,7 @@ def error-rows [s pairs] {
   | where {|p| $p.result.isError? == true}
   | each {|p| {
       session: $s.id,
+      source: $s.source,
       project: $s.project,
       tool: ($p.result.toolName? | default ($p.call?.name?)),
       class: (classify-error (result-text $p.result.content?)),
@@ -184,13 +232,10 @@ def error-rows [s pairs] {
     }}
 }
 
-def "main list" [--project: string, --since: string, --until: string] {
+def "main list" [--project: string, --since: string, --until: string, --source: string] {
   session-files
-  | each {|f|
-      let project = (dir-to-project ($f | path dirname | path basename))
-      let entries = (parse-jsonl $f)
-      meta-from-entries $entries $project $f
-    }
+  | each {|rec| meta-from-entries (parse-jsonl $rec.path) $rec }
+  | where {|s| $source == null or $s.source == $source}
   | where {|s| $project == null or $s.project == $project}
   | where {|s| in-window $s $since $until}
   | to json
@@ -211,12 +256,14 @@ def "main tools" [session_id: string, --tool: string, --errors-only] {
   | to json
 }
 
-def "main errors" [session_id?: string, --all, --group-by: string] {
+def "main errors" [session_id?: string, --all, --group-by: string, --source: string] {
   if ($all == false and $session_id == null) {
     error make {msg: "usage: terapia errors <session-id> | --all"}
   }
   let rows = (if $all {
-    cached-all | get errors | flatten
+    cached-all
+    | where {|sc| $source == null or $sc.meta.source == $source}
+    | get errors | flatten
   } else {
     let s = (resolve-session $session_id)
     error-rows $s (pair-from-entries (parse-jsonl $s.file))
@@ -228,26 +275,29 @@ def "main errors" [session_id?: string, --all, --group-by: string] {
   }
 }
 
-def "main stats" [session_id?: string, --all] {
+def "main stats" [session_id?: string, --all, --source: string] {
   if ($all == false and $session_id == null) {
     error make {msg: "usage: terapia stats <session-id> | --all"}
   }
   if $all {
-    let scans = (cached-all)
+    let scans = (cached-all
+      | where {|sc| $source == null or $sc.meta.source == $source})
     let rows = ($scans | get errors | flatten)
     {
       sessions: ($scans | length),
       tool_calls: ($scans | get meta | get tool_calls | math sum),
       errors: ($rows | length),
       by_class: (group-counts $rows "class"),
+      by_source: (group-counts ($scans | get meta) "source"),
     } | to json
   } else {
     let s = (resolve-session $session_id)
     let entries = (parse-jsonl $s.file)
-    let meta = (meta-from-entries $entries $s.project $s.file)
-    let rows = (error-rows $s (pair-from-entries $entries))
+    let meta = (meta-from-entries $entries ($s | merge {path: $s.file}))
+    let rows = (error-rows $meta (pair-from-entries $entries))
     {
       session: $s.id,
+      source: $s.source,
       messages: $meta.messages,
       tool_calls: $meta.tool_calls,
       errors: ($rows | length),

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-19
+
+### Added
+- `terapia`: **multi-source scan** — alongside pi (`~/.pi/agent/sessions`) it now scans the omp corpus (`~/.omp/agent/sessions`; same JSONL dialect, plus nested subagent transcripts `<project>/<session>/<agent>.jsonl`, decoded with omp's single-dash project encoding). Every output row gains `source`; omp rows also gain `agent` and `title`; `--source pi|omp` filters `list`, `errors --all` and `stats --all`; `stats --all` gains `by_source`. Cache key bumped to v2 so pre-source cached rows can't leak back in. Fixture corpus measured: omp 1069 sessions / 88670 tool calls / 1745 errors; cached `stats --all` 1.3 s vs 58 s cold. Tests: 16/16 (4 new: omp list metadata, `--source` filter, mixed-source stats/errors, omp id resolution).
+
 ## 2026-11-13
 
 ### Added

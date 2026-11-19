@@ -1,4 +1,4 @@
-"""Tests for terapia — the pi session query CLI."""
+"""Tests for terapia — the pi + omp session query CLI."""
 
 import json
 import subprocess
@@ -13,7 +13,10 @@ def run(*args, env_sessions=None):
     env = None
     if env_sessions is not None:
         import os
-        env = dict(os.environ, TERAPIA_SESSIONS=str(env_sessions))
+        omp = env_sessions / "omp"
+        omp.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, TERAPIA_SESSIONS=str(env_sessions),
+                   TERAPIA_OMP_SESSIONS=str(omp))
     return subprocess.run(
         ["nu", "--no-config-file", str(TERAPIA), *args],
         capture_output=True, text=True, env=env,
@@ -62,6 +65,46 @@ def sample_session(sid, cwd="/home/sasha/para/x"):
         {"type": "message", "message": {"role": "assistant", "content": [
             {"type": "thinking", "thinking": "hmm"},
             {"type": "text", "text": "done"}]}},
+    ]
+
+
+def write_omp_session(root, project, ts, sid, cwd, entries, agent=None):
+    # omp layout: <root>/<-project>/[<session-dir>/]<file>.jsonl; project dirs
+    # encode "/" as "-" (single dash), mains at the project root, subagents nested.
+    d = root / f"-{project.replace('/', '-')}"
+    if agent is None:
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{ts.replace(':', '-').replace('.', '-')}Z_{sid}.jsonl"
+    else:
+        d = d / f"{ts.replace(':', '-').replace('.', '-')}Z_{sid}"
+        d.mkdir(parents=True, exist_ok=True)
+        name = f"{agent}.jsonl"
+    entries[0]["timestamp"] = f"{ts}.000Z"
+    with open(d / name, "w") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    return sid
+
+
+def omp_main_session(sid):
+    # omp puts a `title` entry before the `session` header.
+    return [
+        {"type": "title", "v": 1, "title": "Fix parser", "updatedAt": "2026-11-11T00:00:00.000Z"},
+        session_header("2026-11-11T00:00:00.000Z", sid, "/var/home/sasha/x/repo"),
+        user_msg("vamos"),
+        tool_call("k1", "bash", {"command": "pytest -x"}),
+        tool_result("k1", "bash", "Traceback (most recent call last):", True),
+        tool_call("k2", "read", {"path": "x.py"}),
+        tool_result("k2", "read", "all good", False),
+    ]
+
+
+def omp_agent_session(sid):
+    # subagent transcripts carry the title on the session entry itself.
+    return [
+        dict(session_header("2026-11-11T01:00:00.000Z", sid, "/var/home/sasha/x/repo"), title="planner run"),
+        tool_call("a1", "edit", {"path": "x.py"}),
+        tool_result("a1", "edit", "oldText not found in file", True),
     ]
 
 
@@ -157,7 +200,7 @@ def test_cache_created_and_reused(tmp):
     write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
     cache = tmp / "cache"
     import os
-    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_CACHE=str(cache))
+    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_OMP_SESSIONS=str(tmp / "omp"), TERAPIA_CACHE=str(cache))
     r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
                        capture_output=True, text=True, env=env)
     assert r.returncode == 0, r.stderr
@@ -175,7 +218,7 @@ def test_cache_invalidated_on_change(tmp):
     sid = write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-aaa", "/a/proj", sample_session("sid-aaa"))
     cache = tmp / "cache"
     import os
-    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_CACHE=str(cache))
+    env = dict(os.environ, TERAPIA_SESSIONS=str(tmp), TERAPIA_OMP_SESSIONS=str(tmp / "omp"), TERAPIA_CACHE=str(cache))
     r = subprocess.run(["nu", "--no-config-file", str(TERAPIA), "stats", "--all"],
                        capture_output=True, text=True, env=env)
     assert json.loads(r.stdout)["errors"] == 2
@@ -199,6 +242,68 @@ def test_no_heredoc_needed_smoke(tmp):
     assert r.returncode == 0, r.stderr
     out = json.loads(r.stdout)
     assert out["tool_calls"] == 3 and out["errors"] == 2 and out["by_class"] == {"file_not_found": 1, "edit_mismatch": 1}
+
+
+def test_list_includes_omp(tmp):
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-pi", "/a/proj", sample_session("sid-pi"))
+    omp = tmp / "omp"
+    write_omp_session(omp, "x/repo", "2026-11-11T00:00:00", "omp-main-1", "/var/home/sasha/x/repo", omp_main_session("omp-main-1"))
+    write_omp_session(omp, "x/repo", "2026-11-11T01:00:00", "omp-sub-1", "/var/home/sasha/x/repo", omp_agent_session("omp-sub-1"), agent="Planner")
+    r = run("list", env_sessions=tmp)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    pis = [s for s in out if s["source"] == "pi"]
+    assert [s["id"] for s in pis] == ["sid-pi"]
+    omps = {s["id"]: s for s in out if s["source"] == "omp"}
+    assert set(omps) == {"omp-main-1", "omp-sub-1"}
+    main = omps["omp-main-1"]
+    assert main["project"] == "x/repo" and main["agent"] is None
+    assert main["title"] == "Fix parser"
+    assert main["tool_calls"] == 2 and main["errors"] == 1
+    sub = omps["omp-sub-1"]
+    assert sub["agent"] == "Planner"
+    assert sub["title"] == "planner run"
+    assert sub["tool_calls"] == 1 and sub["errors"] == 1
+
+
+def test_list_source_filter(tmp):
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-pi", "/a/proj", sample_session("sid-pi"))
+    write_omp_session(tmp / "omp", "x/repo", "2026-11-11T00:00:00", "omp-main-1", "/var/home/sasha/x/repo", omp_main_session("omp-main-1"))
+    r = run("list", "--source", "omp", env_sessions=tmp)
+    out = json.loads(r.stdout)
+    assert [s["id"] for s in out] == ["omp-main-1"] and all(s["source"] == "omp" for s in out)
+    r = run("list", "--source", "pi", env_sessions=tmp)
+    out = json.loads(r.stdout)
+    assert [s["id"] for s in out] == ["sid-pi"] and all(s["source"] == "pi" for s in out)
+
+
+def test_stats_all_mixed_sources(tmp):
+    write_session(tmp, "a/proj", "2026-10-09T10:00:00", "sid-pi", "/a/proj", sample_session("sid-pi"))
+    omp = tmp / "omp"
+    write_omp_session(omp, "x/repo", "2026-11-11T00:00:00", "omp-main-1", "/var/home/sasha/x/repo", omp_main_session("omp-main-1"))
+    write_omp_session(omp, "x/repo", "2026-11-11T01:00:00", "omp-sub-1", "/var/home/sasha/x/repo", omp_agent_session("omp-sub-1"), agent="Planner")
+    r = run("stats", "--all", env_sessions=tmp)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["sessions"] == 3
+    assert out["by_source"] == {"pi": 1, "omp": 2}
+    assert out["errors"] == 4
+    r = run("errors", "--all", env_sessions=tmp)
+    rows = json.loads(r.stdout)
+    assert {e["source"] for e in rows} == {"pi", "omp"}
+    omp_classes = sorted(e["class"] for e in rows if e["source"] == "omp")
+    assert omp_classes == ["edit_mismatch", "lang_runtime"]
+    r = run("errors", "--all", "--source", "omp", env_sessions=tmp)
+    rows = json.loads(r.stdout)
+    assert len(rows) == 2 and all(e["source"] == "omp" for e in rows)
+
+
+def test_tools_on_omp_session(tmp):
+    write_omp_session(tmp / "omp", "x/repo", "2026-11-11T01:00:00", "omp-sub-1", "/var/home/sasha/x/repo", omp_agent_session("omp-sub-1"), agent="Planner")
+    r = run("tools", "omp-sub-1", env_sessions=tmp)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert [(t["tool"], t["isError"]) for t in out] == [("edit", True)]
 
 
 if __name__ == "__main__":
